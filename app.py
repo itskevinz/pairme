@@ -216,10 +216,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <meta property="og:type" content="website">
     <meta property="og:title" content="PairMe - Fast Cross-Device Sharing">
     <meta property="og:description" content="Share text, links, code, and files instantly across mobile and desktop devices.">
-    <meta property="og:image" content="https://imgg.fr/r/qVsZ8JGy.png">
+    <meta property="og:image" content="https://imgg.fr/r/LkSsr60e.png">
     
-    <link rel="icon" type="image/png" href="https://imgg.fr/r/qVsZ8JGy.png">
-    <link rel="apple-touch-icon" href="https://imgg.fr/r/qVsZ8JGy.png">
+    <link rel="icon" type="image/png" href="https://imgg.fr/r/LkSsr60e.png">
+    <link rel="apple-touch-icon" href="https://imgg.fr/r/LkSsr60e.png">
 
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
@@ -308,7 +308,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <header>
         <div class="brand">
-            <img src="https://imgg.fr/r/qVsZ8JGy.png" alt="Logo">
+            <img src="https://imgg.fr/r/LkSsr60e.png" alt="Logo">
             PairMe
         </div>
         <div class="room-tag" id="room-badge">
