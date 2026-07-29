@@ -429,6 +429,7 @@ var pendingRequest = null;
 var pendingFileQueue = {};
 var relayBuffer = {};
 var relayMeta = {};
+var textStore = {};
 var CHUNK_SIZE = 16384;
 var STUN_SERVERS = {
     iceServers: [
@@ -470,10 +471,6 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function escapeJsString(str) {
-    return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n');
-}
-
 function formatBytes(bytes) {
     if (bytes === 0) return "0 B";
     var k = 1024;
@@ -482,8 +479,10 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
 }
 
-function formatText(text) {
+function renderFormattedContent(text, textId) {
     if (!text) return "";
+    textStore[textId] = text;
+
     var codeBlocks = [];
     var inlineCodes = [];
 
@@ -500,19 +499,15 @@ function formatText(text) {
     var escaped = escapeHtml(placeholderText);
 
     escaped = escaped.replace(/___INLINE_CODE_(\d+)___/g, function(match, index) {
-        var cleanCode = escapeHtml(inlineCodes[index]);
-        return '<code class="inline-code">' + cleanCode + '</code>';
+        return '<code class="inline-code">' + escapeHtml(inlineCodes[index]) + '</code>';
     });
 
     escaped = escaped.replace(/___CODE_BLOCK_(\d+)___/g, function(match, index) {
-        var rawCode = codeBlocks[index];
-        var cleanCode = escapeHtml(rawCode);
-        var safeJsCode = escapeJsString(rawCode);
-
+        var cleanCode = escapeHtml(codeBlocks[index]);
         return '<div class="code-wrapper">' +
                     '<div class="code-header">' +
-                        '<span>Code</span>' +
-                        '<button class="copy-btn" onclick="copyCodeBlock(\'' + safeJsCode + '\', this)">Copy All</button>' +
+                        '<span>Code Block</span>' +
+                        '<button class="copy-btn" onclick="copyCodeBlock(\'' + textId + '\', ' + index + ', this)">Copy Code</button>' +
                     '</div>' +
                     '<pre class="code-block"><code>' + cleanCode + '</code></pre>' +
                '</div>';
@@ -525,21 +520,36 @@ function formatText(text) {
     return escaped;
 }
 
-function copyCodeBlock(codeText, btnElement) {
+function copyFullText(textId, btnElement) {
+    var rawText = textStore[textId] || "";
+    copyToClipboard(rawText, btnElement, "Copied All!");
+}
+
+function copyCodeBlock(textId, codeIndex, btnElement) {
+    var rawText = textStore[textId] || "";
+    var codeBlocks = [];
+    rawText.replace(/```([\s\S]*?)```/g, function(match, code) {
+        codeBlocks.push(code);
+    });
+    var targetCode = codeBlocks[codeIndex] || "";
+    copyToClipboard(targetCode, btnElement, "Copied!");
+}
+
+function copyToClipboard(str, btnElement, msg) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(codeText).then(function() {
-            showCopySuccess(btnElement);
+        navigator.clipboard.writeText(str).then(function() {
+            showCopySuccess(btnElement, msg);
         }).catch(function() {
-            fallbackCopyText(codeText, btnElement);
+            fallbackCopy(str, btnElement, msg);
         });
     } else {
-        fallbackCopyText(codeText, btnElement);
+        fallbackCopy(str, btnElement, msg);
     }
 }
 
-function fallbackCopyText(text, btnElement) {
+function fallbackCopy(str, btnElement, msg) {
     var textArea = document.createElement("textarea");
-    textArea.value = text;
+    textArea.value = str;
     textArea.style.position = "fixed";
     textArea.style.opacity = "0";
     document.body.appendChild(textArea);
@@ -547,14 +557,14 @@ function fallbackCopyText(text, btnElement) {
     textArea.select();
     try {
         document.execCommand('copy');
-        showCopySuccess(btnElement);
+        showCopySuccess(btnElement, msg);
     } catch (err) {}
     document.body.removeChild(textArea);
 }
 
-function showCopySuccess(btnElement) {
+function showCopySuccess(btnElement, msg) {
     var originalText = btnElement.textContent;
-    btnElement.textContent = "Copied!";
+    btnElement.textContent = msg;
     btnElement.style.background = "#16a34a";
     btnElement.style.color = "#ffffff";
     setTimeout(function() {
@@ -944,8 +954,10 @@ function addReceived(type, data, sender) {
 
     var actionHtml = "";
     if (type === "text") {
-        actionHtml = '<div class="feed-body">' + formatText(data) + '</div>' +
-        '<button class="flat icon-only" onclick="navigator.clipboard.writeText(\'' + escapeJsString(data) + '\')" title="Copy" style="width:26px;height:26px;padding:4px;">' +
+        var textId = "txt_" + generateTransferId();
+        var formatted = renderFormattedContent(data, textId);
+        actionHtml = '<div class="feed-body">' + formatted + '</div>' +
+        '<button class="flat icon-only" onclick="copyFullText(\'' + textId + '\', this)" title="Copy All Text" style="width:26px;height:26px;padding:4px;">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
         '</button>';
     } else {
