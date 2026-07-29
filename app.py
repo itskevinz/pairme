@@ -146,7 +146,8 @@ def handle_broadcast_request(data):
             "from_name": peers[request.sid]["name"],
             "file_name": data.get("file_name", "file"),
             "file_size": data.get("file_size", 0),
-            "file_type": data.get("file_type", "")
+            "file_type": data.get("file_type", ""),
+            "transfer_id": data.get("transfer_id")
         }, room=target_sid)
 
 @socketio.on("broadcast_response")
@@ -155,7 +156,8 @@ def handle_broadcast_response(data):
     if target_sid in peers:
         emit("transfer_response", {
             "from": request.sid,
-            "accepted": data.get("accepted", False)
+            "accepted": data.get("accepted", False),
+            "transfer_id": data.get("transfer_id")
         }, room=target_sid)
 
 @socketio.on("relay_text")
@@ -177,7 +179,8 @@ def handle_relay_file_start(data):
             "from_name": peers[request.sid]["name"],
             "file_name": data.get("file_name", "file"),
             "file_size": data.get("file_size", 0),
-            "file_type": data.get("file_type", "")
+            "file_type": data.get("file_type", ""),
+            "transfer_id": data.get("transfer_id")
         }, room=target_sid)
 
 @socketio.on("relay_file_chunk")
@@ -186,6 +189,7 @@ def handle_relay_file_chunk(data):
     if target_sid in peers:
         emit("relay_file_chunk", {
             "from": request.sid,
+            "transfer_id": data.get("transfer_id"),
             "chunk": data.get("chunk", "")
         }, room=target_sid)
 
@@ -193,58 +197,72 @@ def handle_relay_file_chunk(data):
 def handle_relay_file_done(data):
     target_sid = data.get("to")
     if target_sid in peers:
-        emit("relay_file_done", {"from": request.sid}, room=target_sid)
+        emit("relay_file_done", {
+            "from": request.sid,
+            "transfer_id": data.get("transfer_id")
+        }, room=target_sid)
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>PairMe</title>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif; }
-        body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
+        body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; }
         
-        header { background: #ffffff; padding: 12px 20px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; }
-        .brand { font-size: 16px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
-        .room-tag { background: #f1f5f9; color: #475569; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 6px; }
+        header { background: #ffffff; padding: 10px 16px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+        .brand { font-size: 16px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; display: flex; align-items: center; gap: 6px; }
+        .room-tag { background: #f1f5f9; color: #475569; padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 4px; }
 
-        .app-grid { display: grid; grid-template-columns: 280px 1fr 320px; gap: 16px; padding: 16px; height: calc(100vh - 57px); }
-        .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
-        .card-header { padding: 12px 14px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; background: #ffffff; }
-        .card-body { padding: 14px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+        .mobile-nav { display: none; background: #ffffff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; }
+        .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 10px 0; color: #64748b; font-size: 13px; font-weight: 600; border-radius: 0; }
+        .mobile-nav button.active { color: #0f172a; border-bottom-color: #0f172a; background: transparent; }
 
-        input, select, textarea { font-size: 13px; border-radius: 6px; border: 1px solid #cbd5e1; background: #ffffff; color: #0f172a; padding: 8px 10px; outline: none; transition: border-color 0.15s; }
+        .app-grid { display: grid; grid-template-columns: 280px 1fr 300px; gap: 12px; padding: 12px; height: calc(100vh - 53px); flex: 1; overflow: hidden; }
+        .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; height: 100%; }
+        .card-header { padding: 10px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; background: #ffffff; flex-shrink: 0; }
+        .card-body { padding: 12px; flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 10px; }
+
+        input, select, textarea { font-size: 13px; border-radius: 6px; border: 1px solid #cbd5e1; background: #ffffff; color: #0f172a; padding: 8px 10px; outline: none; -webkit-appearance: none; appearance: none; }
         input:focus, select:focus, textarea:focus { border-color: #0f172a; }
         
-        button { background: #0f172a; color: #ffffff; border: 1px solid #0f172a; border-radius: 6px; font-size: 13px; font-weight: 500; padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; transition: background-color 0.15s, border-color 0.15s; }
-        button:hover { background: #334155; border-color: #334155; }
+        button { background: #0f172a; color: #ffffff; border: 1px solid #0f172a; border-radius: 6px; font-size: 13px; font-weight: 500; padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-appearance: none; }
+        button:active { opacity: 0.8; }
         button.flat { background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; }
-        button.flat:hover { background: #f8fafc; border-color: #94a3b8; }
-        button.icon-only { padding: 8px; width: 34px; height: 34px; }
+        button.icon-only { padding: 8px; width: 34px; height: 34px; flex-shrink: 0; }
 
         .row { display: flex; gap: 8px; align-items: center; }
-        .flex-1 { flex: 1; }
+        .flex-1 { flex: 1; min-width: 0; }
 
-        .peer-item { background: #ffffff; border: 1px solid #e2e8f0; padding: 10px 12px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: all 0.15s; }
-        .peer-item:hover, .peer-item.active { border-color: #0f172a; background: #f8fafc; }
+        .peer-item { background: #ffffff; border: 1px solid #e2e8f0; padding: 8px 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
+        .peer-item:active, .peer-item.active { border-color: #0f172a; background: #f8fafc; }
         .peer-info { display: flex; flex-direction: column; }
         .peer-name { font-weight: 600; font-size: 13px; color: #0f172a; }
-        .peer-id { font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace; }
+        .peer-id { font-size: 11px; color: #94a3b8; font-family: monospace; }
 
-        .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 24px; text-align: center; color: #64748b; cursor: pointer; transition: all 0.15s; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 13px; }
-        .drop-zone:hover, .drop-zone.dragover { border-color: #0f172a; background: #f1f5f9; color: #0f172a; }
+        .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 16px; text-align: center; color: #64748b; cursor: pointer; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
 
-        .feed-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
-        .feed-item { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 6px; font-size: 13px; }
+        .feed-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+        .feed-item { background: #f8fafc; border: 1px solid #e2e8f0; padding: 10px; border-radius: 6px; font-size: 13px; }
         .feed-meta { font-size: 11px; color: #64748b; margin-bottom: 6px; display: flex; justify-content: space-between; }
-        .feed-body { word-break: break-all; white-space: pre-wrap; margin-bottom: 8px; color: #1e293b; }
+        .feed-body { word-break: break-word; white-space: pre-wrap; margin-bottom: 6px; color: #1e293b; font-size: 13px; line-height: 1.4; }
 
-        #log-container { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
-        .log-entry { padding: 6px 8px; border-radius: 4px; display: flex; gap: 8px; align-items: flex-start; line-height: 1.4; border: 1px solid transparent; }
+        .text-link { color: #2563eb; text-decoration: underline; word-break: break-all; }
+        .inline-code { background: #e2e8f0; color: #0f172a; padding: 2px 4px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+        .code-block { background: #0f172a; color: #f8fafc; padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; overflow-x: auto; margin: 4px 0; white-space: pre; }
+
+        .file-preview { margin: 6px 0; max-width: 100%; text-align: center; background: #edf2f7; border-radius: 6px; overflow: hidden; }
+        .preview-img { max-width: 100%; max-height: 200px; display: block; margin: 0 auto; object-fit: contain; }
+
+        .dl-btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; background: #0f172a; color: #ffffff; text-decoration: none; border-radius: 4px; font-size: 11px; font-weight: 500; margin-top: 4px; }
+
+        #log-container { font-family: monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
+        .log-entry { padding: 4px 6px; border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.3; }
         .log-time { color: #94a3b8; flex-shrink: 0; }
-        .log-tag { padding: 1px 5px; border-radius: 3px; font-weight: 700; font-size: 9px; text-transform: uppercase; flex-shrink: 0; }
+        .log-tag { padding: 1px 4px; border-radius: 3px; font-weight: 700; font-size: 9px; text-transform: uppercase; flex-shrink: 0; }
         
         .tag-info { background: #e0f2fe; color: #0369a1; }
         .tag-success { background: #dcfce7; color: #15803d; }
@@ -252,15 +270,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .tag-error { background: #fee2e2; color: #b91c1c; }
         .tag-p2p { background: #f3e8ff; color: #6b21a8; }
 
-        .progress-bar { height: 4px; background: #e2e8f0; border-radius: 2px; overflow: hidden; margin-top: 6px; }
-        .progress-fill { height: 100%; background: #0f172a; width: 0%; transition: width 0.1s; }
+        .progress-bar { height: 4px; background: #e2e8f0; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+        .progress-fill { height: 100%; background: #0f172a; width: 0%; }
 
-        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.4); z-index: 100; justify-content: center; align-items: center; }
-        .modal { background: #ffffff; border: 1px solid #e2e8f0; padding: 20px; border-radius: 8px; width: 300px; text-align: center; }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.4); z-index: 100; justify-content: center; align-items: center; padding: 16px; }
+        .modal { background: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; width: 100%; max-width: 300px; text-align: center; }
 
-        @media (max-width: 900px) {
-            body { height: auto; overflow: auto; }
-            .app-grid { grid-template-columns: 1fr; height: auto; }
+        @media (max-width: 768px) {
+            body { height: 100%; overflow: auto; }
+            .mobile-nav { display: flex; }
+            .app-grid { display: flex; flex-direction: column; height: auto; padding: 8px; grid-template-columns: none; overflow: visible; }
+            .card { display: none; height: auto; min-height: calc(100vh - 110px); }
+            .card.mobile-active { display: flex; }
         }
     </style>
 </head>
@@ -277,8 +298,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </header>
 
+    <div class="mobile-nav">
+        <button id="nav-devices" class="active" onclick="switchTab('devices')">Devices</button>
+        <button id="nav-transfer" onclick="switchTab('transfer')">Transfer</button>
+        <button id="nav-logs" onclick="switchTab('logs')">Logs</button>
+    </div>
+
     <div class="app-grid">
-        <div class="card">
+        <div class="card mobile-active" id="card-devices">
             <div class="card-header">
                 <span>Devices</span>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
@@ -286,7 +313,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="card-body">
                 <div>
                     <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">THIS DEVICE</div>
-                    <div id="my-id" style="font-family:ui-monospace,monospace;font-size:13px;font-weight:700;color:#0f172a;">---</div>
+                    <div id="my-id" style="font-family:monospace;font-size:13px;font-weight:700;color:#0f172a;">---</div>
                 </div>
                 <div class="row">
                     <input type="text" id="my-name" placeholder="Device Name" class="flex-1">
@@ -305,14 +332,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
                     </button>
                 </div>
-                <div class="card-header" style="margin:8px -14px 0 -14px;border-top:1px solid #f1f5f9;">Nearby</div>
+                <div class="card-header" style="margin:8px -12px 0 -12px;border-top:1px solid #f1f5f9;">Nearby</div>
                 <div id="peer-list" style="display:flex;flex-direction:column;gap:6px;">
                     <div style="color:#94a3b8;font-size:12px;">No devices detected</div>
                 </div>
             </div>
         </div>
 
-        <div class="card">
+        <div class="card" id="card-transfer">
             <div class="card-header">
                 <span>Transfer</span>
                 <span id="target-peer-label" style="color:#0f172a;text-transform:none;font-weight:600;">To: Everyone</span>
@@ -324,7 +351,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     </select>
                 </div>
                 <div class="row">
-                    <textarea id="text-input" rows="2" placeholder="Message, link, or snippet..." class="flex-1"></textarea>
+                    <textarea id="text-input" rows="2" placeholder="Message, link, or code..." class="flex-1"></textarea>
                     <button class="icon-only" onclick="sendText()" title="Send">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                     </button>
@@ -332,7 +359,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                    <span>Drop files here or click to browse</span>
+                    <span>Tap or drag files here</span>
                     <input type="file" id="file-input" multiple style="display:none;" onchange="handleFileSelect(event)">
                 </div>
 
@@ -344,19 +371,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
                 </div>
 
-                <div class="card-header" style="margin:0 -14px;">Received</div>
+                <div class="card-header" style="margin:0 -12px;">Received</div>
                 <ul class="feed-list" id="received-list"></ul>
             </div>
         </div>
 
-        <div class="card">
+        <div class="card" id="card-logs">
             <div class="card-header">
                 <span>Logs</span>
-                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:24px;height:24px;padding:4px;">
+                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:24px;height:24px;padding:2px;">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
             </div>
-            <div class="card-body" style="padding:10px;">
+            <div class="card-body" style="padding:8px;">
                 <div id="log-container"></div>
             </div>
         </div>
@@ -374,27 +401,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
 <script>
-let socket = null;
-let mySid = "";
-let myPeerId = "";
-let peerList = [];
-let connections = {};
-let pendingRequest = null;
-let pendingFileQueue = {};
-const CHUNK_SIZE = 16384;
-const STUN_SERVERS = {
+var socket = null;
+var mySid = "";
+var myPeerId = "";
+var peerList = [];
+var connections = {};
+var pendingRequest = null;
+var pendingFileQueue = {};
+var relayBuffer = {};
+var relayMeta = {};
+var CHUNK_SIZE = 16384;
+var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" }
     ]
 };
 
-function log(msg, type = "info") {
-    const el = document.getElementById("log-container");
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const entry = document.createElement("div");
+function switchTab(tab) {
+    var cards = ["devices", "transfer", "logs"];
+    for (var i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        document.getElementById("card-" + c).classList.remove("mobile-active");
+        document.getElementById("nav-" + c).classList.remove("active");
+    }
+    document.getElementById("card-" + tab).classList.add("mobile-active");
+    document.getElementById("nav-" + tab).classList.add("active");
+}
+
+function log(msg, type) {
+    type = type || "info";
+    var el = document.getElementById("log-container");
+    var now = new Date();
+    var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2) + ":" + ("0" + now.getSeconds()).slice(-2);
+    var entry = document.createElement("div");
     entry.className = "log-entry";
-    entry.innerHTML = `<span class="log-time">${time}</span><span class="log-tag tag-${type}">${type}</span><span style="word-break:break-all;">${escapeHtml(msg)}</span>`;
+    entry.innerHTML = '<span class="log-time">' + time + '</span><span class="log-tag tag-' + type + '">' + type + '</span><span style="word-break:break-all;">' + escapeHtml(msg) + '</span>';
     el.appendChild(entry);
     el.scrollTop = el.scrollHeight;
 }
@@ -404,109 +446,129 @@ function clearLogs() {
 }
 
 function escapeHtml(text) {
-    const div = document.createElement("div");
+    var div = document.createElement("div");
     div.textContent = text;
     return div.innerHTML;
 }
 
+function escapeJsString(str) {
+    return str.replace(/\\\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
 function formatBytes(bytes) {
     if (bytes === 0) return "0 B";
-    const k = 1024, sizes = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    var k = 1024;
+    var sizes = ["B", "KB", "MB", "GB"];
+    var i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+function formatText(text) {
+    var escaped = escapeHtml(text);
+    escaped = escaped.replace(/```([\s\S]*?)```/g, function(match, code) {
+        return '<pre class="code-block"><code>' + code + '</code></pre>';
+    });
+    escaped = escaped.replace(/`([^`]+)`/g, function(match, code) {
+        return '<code class="inline-code">' + code + '</code>';
+    });
+    escaped = escaped.replace(/(https?:\/\/[^\s<]+)/g, function(url) {
+        return '<a href="' + url + '" target="_blank" rel="noopener" class="text-link">' + url + '</a>';
+    });
+    return escaped;
+}
+
+function generateTransferId() {
+    return Date.now() + "_" + Math.floor(Math.random() * 100000);
 }
 
 function initSocket() {
     socket = io({ transports: ["websocket", "polling"] });
 
-    socket.on("connect", () => {
+    socket.on("connect", function() {
         log("Connected to server", "success");
-        const saved = localStorage.getItem("pairme_name");
+        var saved = localStorage.getItem("pairme_name");
         if (saved) {
             document.getElementById("my-name").value = saved;
             socket.emit("set_name", { name: saved });
         }
     });
 
-    socket.on("init", data => {
+    socket.on("init", function(data) {
         mySid = data.sid;
         myPeerId = data.peer_id;
         document.getElementById("my-id").textContent = myPeerId;
-        log(`ID: ${myPeerId}`, "info");
+        log("ID: " + myPeerId, "info");
     });
 
-    socket.on("peers", data => {
+    socket.on("peers", function(data) {
         peerList = data;
         renderPeers();
     });
 
     socket.on("signal", handleSignal);
 
-    socket.on("transfer_request", data => {
+    socket.on("transfer_request", function(data) {
         pendingRequest = data;
-        document.getElementById("request-details").textContent = `${data.from_name} -> ${data.file_name} (${formatBytes(data.file_size)})`;
+        document.getElementById("request-details").textContent = data.from_name + " -> " + data.file_name + " (" + formatBytes(data.file_size) + ")";
         document.getElementById("request-modal").style.display = "flex";
     });
 
-    socket.on("transfer_response", data => {
+    socket.on("transfer_response", function(data) {
         if (data.accepted) {
             log("Accepted by peer", "success");
-            startDataTransfer(data.from);
+            startDataTransfer(data.from, data.transfer_id);
         } else {
             log("Declined by peer", "warn");
         }
     });
 
-    socket.on("room_joined", data => {
+    socket.on("room_joined", function(data) {
         document.getElementById("room-name").textContent = data.code;
-        log(`Joined room ${data.code}`, "success");
+        log("Joined room " + data.code, "success");
     });
 
-    socket.on("room_left", () => {
+    socket.on("room_left", function() {
         document.getElementById("room-name").textContent = "Lobby";
         log("Switched to Lobby", "info");
     });
 
-    socket.on("relay_text", data => {
+    socket.on("relay_text", function(data) {
         addReceived("text", data.text, data.from_name);
-        log(`Text from ${data.from_name}`, "info");
+        log("Text from " + data.from_name, "info");
     });
 
-    let relayBuffer = {};
-    let relayMeta = {};
-
-    socket.on("relay_file_start", data => {
-        relayBuffer[data.from] = [];
-        relayMeta[data.from] = data;
-        log(`Receiving ${data.file_name}`, "info");
+    socket.on("relay_file_start", function(data) {
+        relayBuffer[data.transfer_id] = [];
+        relayMeta[data.transfer_id] = data;
+        log("Receiving " + data.file_name, "info");
     });
 
-    socket.on("relay_file_chunk", data => {
-        if (relayBuffer[data.from]) {
-            const binary = atob(data.chunk);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            relayBuffer[data.from].push(bytes.buffer);
+    socket.on("relay_file_chunk", function(data) {
+        if (relayBuffer[data.transfer_id]) {
+            var binary = atob(data.chunk);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            relayBuffer[data.transfer_id].push(bytes.buffer);
         }
     });
 
-    socket.on("relay_file_done", data => {
-        const meta = relayMeta[data.from];
-        const buffers = relayBuffer[data.from];
+    socket.on("relay_file_done", function(data) {
+        var meta = relayMeta[data.transfer_id];
+        var buffers = relayBuffer[data.transfer_id];
         if (meta && buffers) {
-            const blob = new Blob(buffers, { type: meta.file_type });
-            const url = URL.createObjectURL(blob);
+            var blob = new Blob(buffers, { type: meta.file_type });
+            var url = URL.createObjectURL(blob);
             addReceived("file", { name: meta.file_name, size: meta.file_size, url: url, type: meta.file_type }, meta.from_name);
-            log(`Received ${meta.file_name}`, "success");
-            delete relayBuffer[data.from];
-            delete relayMeta[data.from];
+            log("Received " + meta.file_name, "success");
+            delete relayBuffer[data.transfer_id];
+            delete relayMeta[data.transfer_id];
         }
     });
 }
 
 function renderPeers() {
-    const list = document.getElementById("peer-list");
-    const select = document.getElementById("peer-select");
+    var list = document.getElementById("peer-list");
+    var select = document.getElementById("peer-select");
     list.innerHTML = "";
     select.innerHTML = '<option value="">-- All Devices --</option>';
 
@@ -515,17 +577,17 @@ function renderPeers() {
         return;
     }
 
-    peerList.forEach(p => {
-        const item = document.createElement("div");
+    peerList.forEach(function(p) {
+        var item = document.createElement("div");
         item.className = "peer-item";
-        item.onclick = () => selectPeer(p.sid);
-        item.innerHTML = `<div class="peer-info"><span class="peer-name">${escapeHtml(p.name)}</span><span class="peer-id">${p.id}</span></div>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>`;
+        item.onclick = function() { selectPeer(p.sid); };
+        item.innerHTML = '<div class="peer-info"><span class="peer-name">' + escapeHtml(p.name) + '</span><span class="peer-id">' + p.id + '</span></div>' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>';
         list.appendChild(item);
 
-        const opt = document.createElement("option");
+        var opt = document.createElement("option");
         opt.value = p.sid;
-        opt.textContent = `${p.name} (${p.id})`;
+        opt.textContent = p.name + " (" + p.id + ")";
         select.appendChild(opt);
     });
 }
@@ -533,14 +595,17 @@ function renderPeers() {
 function selectPeer(sid) {
     document.getElementById("peer-select").value = sid;
     onPeerSelectChange();
+    if (window.innerWidth <= 768) {
+        switchTab("transfer");
+    }
 }
 
 function onPeerSelectChange() {
-    const sid = document.getElementById("peer-select").value;
-    const label = document.getElementById("target-peer-label");
+    var sid = document.getElementById("peer-select").value;
+    var label = document.getElementById("target-peer-label");
     if (sid) {
-        const p = peerList.find(x => x.sid === sid);
-        label.textContent = `To: ${p ? p.name : sid}`;
+        var p = peerList.find(function(x) { return x.sid === sid; });
+        label.textContent = "To: " + (p ? p.name : sid);
         connectPeer(sid);
     } else {
         label.textContent = "To: Everyone";
@@ -548,16 +613,16 @@ function onPeerSelectChange() {
 }
 
 function updateName() {
-    const name = document.getElementById("my-name").value.trim();
+    var name = document.getElementById("my-name").value.trim();
     if (name) {
         socket.emit("set_name", { name: name });
         localStorage.setItem("pairme_name", name);
-        log(`Updated name: ${name}`, "success");
+        log("Updated name: " + name, "success");
     }
 }
 
 function joinRoom() {
-    const code = document.getElementById("room-code-input").value.trim();
+    var code = document.getElementById("room-code-input").value.trim();
     if (code.length === 6) socket.emit("join_room_code", { code: code });
 }
 
@@ -567,21 +632,21 @@ function leaveRoom() { socket.emit("leave_room_code"); }
 function getOrCreateConnection(targetSid, isInitiator) {
     if (connections[targetSid]) return connections[targetSid];
 
-    const pc = new RTCPeerConnection(STUN_SERVERS);
+    var pc = new RTCPeerConnection(STUN_SERVERS);
     pc.iceQueue = [];
     pc.targetSid = targetSid;
-    pc.receiveBuffer = [];
+    pc.receiveBuffer = {};
 
-    pc.onicecandidate = e => {
+    pc.onicecandidate = function(e) {
         if (e.candidate) {
             socket.emit("signal", { to: targetSid, signal: { type: "ice", candidate: e.candidate } });
         }
     };
 
-    pc.ondatachannel = e => setupDataChannel(pc, e.channel, targetSid);
+    pc.ondatachannel = function(e) { setupDataChannel(pc, e.channel, targetSid); };
 
     if (isInitiator) {
-        const channel = pc.createDataChannel("pairme", { ordered: true });
+        var channel = pc.createDataChannel("pairme", { ordered: true });
         setupDataChannel(pc, channel, targetSid);
     }
 
@@ -591,110 +656,114 @@ function getOrCreateConnection(targetSid, isInitiator) {
 
 function setupDataChannel(pc, channel, targetSid) {
     pc.dataChannel = channel;
-    channel.onopen = () => log(`P2P open with ${targetSid.slice(0, 4)}`, "p2p");
-    channel.onmessage = e => handleDataMessage(e.data, targetSid);
-    channel.onerror = err => log(`Channel error: ${err.message}`, "error");
+    channel.onopen = function() { log("P2P open with " + targetSid.slice(0, 4), "p2p"); };
+    channel.onmessage = function(e) { handleDataMessage(e.data, targetSid); };
+    channel.onerror = function(err) { log("Channel error: " + err.message, "error"); };
 }
 
 function handleSignal(data) {
-    const fromSid = data.from;
-    const signal = data.signal;
-    const pc = getOrCreateConnection(fromSid, false);
+    var fromSid = data.from;
+    var signal = data.signal;
+    var pc = getOrCreateConnection(fromSid, false);
 
     if (signal.type === "offer") {
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
-            .then(() => {
+            .then(function() {
                 while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
                 return pc.createAnswer();
             })
-            .then(ans => pc.setLocalDescription(ans))
-            .then(() => socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } }))
-            .catch(err => log(`Offer err: ${err.message}`, "error"));
+            .then(function(ans) { return pc.setLocalDescription(ans); })
+            .then(function() { socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } }); })
+            .catch(function(err) { log("Offer err: " + err.message, "error"); });
     } else if (signal.type === "answer") {
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
-            .then(() => {
+            .then(function() {
                 while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
             })
-            .catch(err => log(`Answer err: ${err.message}`, "error"));
+            .catch(function(err) { log("Answer err: " + err.message, "error"); });
     } else if (signal.type === "ice") {
-        const candidate = new RTCIceCandidate(signal.candidate);
+        var candidate = new RTCIceCandidate(signal.candidate);
         if (pc.remoteDescription && pc.remoteDescription.type) pc.addIceCandidate(candidate);
         else pc.iceQueue.push(candidate);
     }
 }
 
 function connectPeer(targetSid) {
-    const pc = getOrCreateConnection(targetSid, true);
+    var pc = getOrCreateConnection(targetSid, true);
     pc.createOffer()
-        .then(offer => pc.setLocalDescription(offer))
-        .then(() => socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } }))
-        .catch(err => log(`Offer err: ${err.message}`, "error"));
+        .then(function(offer) { return pc.setLocalDescription(offer); })
+        .then(function() { socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } }); })
+        .catch(function(err) { log("Offer err: " + err.message, "error"); });
 }
 
 function sendText() {
-    const text = document.getElementById("text-input").value.trim();
+    var text = document.getElementById("text-input").value.trim();
     if (!text) return;
-    const targetSid = document.getElementById("peer-select").value;
+    var targetSid = document.getElementById("peer-select").value;
 
     if (targetSid) {
         sendTextTo(targetSid, text);
     } else {
-        peerList.forEach(p => sendTextTo(p.sid, text));
+        peerList.forEach(function(p) { sendTextTo(p.sid, text); });
     }
     document.getElementById("text-input").value = "";
 }
 
 function sendTextTo(targetSid, text) {
-    const pc = connections[targetSid];
+    var pc = connections[targetSid];
     if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
         pc.dataChannel.send(JSON.stringify({ t: "txt", c: text }));
-        log(`Sent text (P2P)`, "p2p");
+        log("Sent text (P2P)", "p2p");
     } else {
         socket.emit("relay_text", { to: targetSid, text: text });
-        log(`Sent text (Relay)`, "info");
+        log("Sent text (Relay)", "info");
     }
 }
 
 function handleFileSelect(e) {
-    const files = e.target.files;
+    var files = e.target.files;
     if (!files.length) return;
-    const targetSid = document.getElementById("peer-select").value;
+    var targetSid = document.getElementById("peer-select").value;
 
-    for (let file of files) {
+    for (var i = 0; i < files.length; i++) {
+        var file = files[i];
         if (targetSid) {
             sendFileTo(targetSid, file);
         } else {
-            peerList.forEach(p => sendFileTo(p.sid, file));
+            peerList.forEach(function(p) { sendFileTo(p.sid, file); });
         }
     }
+    document.getElementById("file-input").value = "";
 }
 
 function sendFileTo(targetSid, file) {
-    const pc = connections[targetSid];
+    var transferId = generateTransferId();
+    var pc = connections[targetSid];
     if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
         if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
-        pendingFileQueue[targetSid].push({ file: file });
+        pendingFileQueue[targetSid].push({ file: file, transfer_id: transferId });
         if (pendingFileQueue[targetSid].length === 1) {
-            socket.emit("broadcast_request", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type });
+            socket.emit("broadcast_request", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type, transfer_id: transferId });
         }
     } else {
-        relaySendFile(targetSid, file);
+        relaySendFile(targetSid, file, transferId);
     }
 }
 
-function startDataTransfer(targetSid) {
-    const queue = pendingFileQueue[targetSid];
+function startDataTransfer(targetSid, transferId) {
+    var queue = pendingFileQueue[targetSid];
     if (!queue || !queue.length) return;
-    const file = queue[0].file;
-    const pc = connections[targetSid];
-    const channel = pc.dataChannel;
+    var item = queue[0];
+    var file = item.file;
+    var pc = connections[targetSid];
+    var channel = pc.dataChannel;
 
-    channel.send(JSON.stringify({ t: "fs", n: file.name, s: file.size, m: file.type }));
+    channel.send(JSON.stringify({ t: "fs", n: file.name, s: file.size, m: file.type, id: item.transfer_id }));
 
-    const reader = new FileReader();
-    reader.onload = e => {
-        const buffer = e.target.result;
-        let offset = 0;
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        var buffer = e.target.result;
+        var offset = 0;
         document.getElementById("progress-wrap").style.display = "block";
 
         function sendChunk() {
@@ -703,47 +772,47 @@ function startDataTransfer(targetSid) {
                     setTimeout(sendChunk, 20);
                     return;
                 }
-                const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+                var chunk = buffer.slice(offset, offset + CHUNK_SIZE);
                 channel.send(chunk);
                 offset += CHUNK_SIZE;
-                const pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
+                var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
                 document.getElementById("progress-fill").style.width = pct + "%";
                 document.getElementById("send-pct").textContent = pct + "%";
             }
-            channel.send(JSON.stringify({ t: "fe" }));
-            log(`Sent ${file.name} (P2P)`, "success");
-            setTimeout(() => { document.getElementById("progress-wrap").style.display = "none"; }, 800);
+            channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
+            log("Sent " + file.name + " (P2P)", "success");
+            setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
             queue.shift();
-            if (queue.length) socket.emit("broadcast_request", { to: targetSid, file_name: queue[0].file.name, file_size: queue[0].file.size });
+            if (queue.length) socket.emit("broadcast_request", { to: targetSid, file_name: queue[0].file.name, file_size: queue[0].file.size, transfer_id: queue[0].transfer_id });
         };
         sendChunk();
     };
     reader.readAsArrayBuffer(file);
 }
 
-function relaySendFile(targetSid, file) {
-    socket.emit("relay_file_start", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type });
-    const reader = new FileReader();
-    reader.onload = e => {
-        const bytes = new Uint8Array(e.target.result);
-        let offset = 0;
+function relaySendFile(targetSid, file, transferId) {
+    socket.emit("relay_file_start", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type, transfer_id: transferId });
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        var bytes = new Uint8Array(e.target.result);
+        var offset = 0;
         document.getElementById("progress-wrap").style.display = "block";
 
         function sendRelayChunk() {
             if (offset < bytes.length) {
-                const chunk = bytes.subarray(offset, offset + CHUNK_SIZE);
-                let binary = '';
-                for (let i = 0; i < chunk.length; i++) binary += String.fromCharCode(chunk[i]);
-                socket.emit("relay_file_chunk", { to: targetSid, chunk: btoa(binary) });
+                var chunk = bytes.subarray(offset, offset + CHUNK_SIZE);
+                var binary = '';
+                for (var i = 0; i < chunk.length; i++) binary += String.fromCharCode(chunk[i]);
+                socket.emit("relay_file_chunk", { to: targetSid, transfer_id: transferId, chunk: btoa(binary) });
                 offset += CHUNK_SIZE;
-                const pct = Math.min(100, Math.round((offset / bytes.length) * 100));
+                var pct = Math.min(100, Math.round((offset / bytes.length) * 100));
                 document.getElementById("progress-fill").style.width = pct + "%";
                 document.getElementById("send-pct").textContent = pct + "%";
                 setTimeout(sendRelayChunk, 5);
             } else {
-                socket.emit("relay_file_done", { to: targetSid });
-                log(`Sent ${file.name} (Relay)`, "success");
-                setTimeout(() => { document.getElementById("progress-wrap").style.display = "none"; }, 800);
+                socket.emit("relay_file_done", { to: targetSid, transfer_id: transferId });
+                log("Sent " + file.name + " (Relay)", "success");
+                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
             }
         }
         sendRelayChunk();
@@ -753,64 +822,71 @@ function relaySendFile(targetSid, file) {
 
 function handleDataMessage(data, fromSid) {
     if (typeof data === "string") {
-        const msg = JSON.parse(data);
+        var msg = JSON.parse(data);
         if (msg.t === "txt") {
             addReceived("text", msg.c, fromSid);
         } else if (msg.t === "fs") {
-            const pc = connections[fromSid];
-            pc.fileMeta = msg;
-            pc.receiveBuffer = [];
+            var pc = connections[fromSid];
+            pc.activeMeta = msg;
+            pc.receiveBuffer[msg.id] = [];
         } else if (msg.t === "fe") {
-            const pc = connections[fromSid];
-            const blob = new Blob(pc.receiveBuffer, { type: pc.fileMeta.m });
-            const url = URL.createObjectURL(blob);
-            addReceived("file", { name: pc.fileMeta.n, size: pc.fileMeta.s, url: url, type: pc.fileMeta.m }, fromSid);
-            log(`Received ${pc.fileMeta.n}`, "success");
+            var pc = connections[fromSid];
+            var buffers = pc.receiveBuffer[msg.id];
+            if (buffers) {
+                var blob = new Blob(buffers, { type: pc.activeMeta.m });
+                var url = URL.createObjectURL(blob);
+                addReceived("file", { name: pc.activeMeta.n, size: pc.activeMeta.s, url: url, type: pc.activeMeta.m }, fromSid);
+                log("Received " + pc.activeMeta.n, "success");
+                delete pc.receiveBuffer[msg.id];
+            }
         }
     } else {
-        const pc = connections[fromSid];
-        if (pc && pc.receiveBuffer) pc.receiveBuffer.push(data);
+        var pc = connections[fromSid];
+        if (pc && pc.activeMeta && pc.receiveBuffer[pc.activeMeta.id]) {
+            pc.receiveBuffer[pc.activeMeta.id].push(data);
+        }
     }
 }
 
 function addReceived(type, data, sender) {
-    const list = document.getElementById("received-list");
-    const li = document.createElement("li");
+    var list = document.getElementById("received-list");
+    var li = document.createElement("li");
     li.className = "feed-item";
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    var now = new Date();
+    var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2);
 
-    let actionHtml = "";
+    var actionHtml = "";
     if (type === "text") {
-        actionHtml = `<div class="feed-body">${escapeHtml(data)}</div>
-        <button class="flat icon-only" onclick="navigator.clipboard.writeText('${escapeHtml(data)}')" title="Copy" style="width:26px;height:26px;padding:4px;">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        </button>`;
+        actionHtml = '<div class="feed-body">' + formatText(data) + '</div>' +
+        '<button class="flat icon-only" onclick="navigator.clipboard.writeText(\'' + escapeJsString(data) + '\')" title="Copy" style="width:26px;height:26px;padding:4px;">' +
+            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+        '</button>';
     } else {
-        actionHtml = `<div class="feed-body"><b>${escapeHtml(data.name)}</b> <span style="font-size:11px;color:#64748b;">(${formatBytes(data.size)})</span></div>
-        <a href="${data.url}" download="${data.name}" style="display:inline-flex;align-items:center;gap:4px;padding:4px 8px;background:#0f172a;color:#fff;text-decoration:none;border-radius:4px;font-size:11px;font-weight:500;">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            Download
-        </a>`;
+        var isImage = data.type && data.type.indexOf("image/") === 0;
+        var previewHtml = isImage ? '<div class="file-preview"><img src="' + data.url + '" class="preview-img" alt="preview" /></div>' : '';
+        actionHtml = '<div class="feed-body"><b>' + escapeHtml(data.name) + '</b> <span style="font-size:11px;color:#64748b;">(' + formatBytes(data.size) + ')</span></div>' + previewHtml +
+        '<a href="' + data.url + '" download="' + escapeHtml(data.name) + '" class="dl-btn">' +
+            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+            'Download' +
+        '</a>';
     }
 
-    li.innerHTML = `<div class="feed-meta"><span>${escapeHtml(sender)}</span><span>${time}</span></div>${actionHtml}`;
+    li.innerHTML = '<div class="feed-meta"><span>' + escapeHtml(sender) + '</span><span>' + time + '</span></div>' + actionHtml;
     list.insertBefore(li, list.firstChild);
 }
 
 function respondRequest(accepted) {
     document.getElementById("request-modal").style.display = "none";
     if (pendingRequest) {
-        socket.emit("broadcast_response", { to: pendingRequest.from, accepted: accepted });
+        socket.emit("broadcast_response", { to: pendingRequest.from, accepted: accepted, transfer_id: pendingRequest.transfer_id });
         pendingRequest = null;
     }
 }
 
-const dropZone = document.getElementById("drop-zone");
-dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
-dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
-dropZone.addEventListener("drop", e => {
+var dropZone = document.getElementById("drop-zone");
+dropZone.addEventListener("dragover", function(e) { e.preventDefault(); });
+dropZone.addEventListener("drop", function(e) {
     e.preventDefault();
-    dropZone.classList.remove("dragover");
     handleFileSelect({ target: { files: e.dataTransfer.files } });
 });
 
