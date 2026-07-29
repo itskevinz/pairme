@@ -202,7 +202,7 @@ def handle_relay_file_done(data):
             "transfer_id": data.get("transfer_id")
         }, room=target_sid)
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -465,7 +465,7 @@ function formatBytes(bytes) {
 
 function formatText(text) {
     var escaped = escapeHtml(text);
-    escaped = escaped.replace(/```([\s\S]*?)```/g, function(match, code) {
+    escaped = escaped.replace(/```([\\s\\S]*?)```/g, function(match, code) {
         return '<pre class="code-block"><code>' + code + '</code></pre>';
     });
     escaped = escaped.replace(/`([^`]+)`/g, function(match, code) {
