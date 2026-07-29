@@ -259,24 +259,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 16px; text-align: center; color: #64748b; cursor: pointer; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
 
-        .feed-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
-        .feed-item { background: #f8fafc; border: 1px solid #e2e8f0; padding: 10px; border-radius: 6px; font-size: 13px; }
-        .feed-meta { font-size: 11px; color: #64748b; margin-bottom: 6px; display: flex; justify-content: space-between; }
-        .feed-body { word-break: break-word; white-space: pre-wrap; margin-bottom: 6px; color: #1e293b; font-size: 13px; line-height: 1.4; }
+        .feed-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+        .feed-item { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; font-size: 13px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); display: flex; flex-direction: column; gap: 8px; }
+        .feed-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
+        .feed-author { font-weight: 600; font-size: 12px; color: #334155; display: flex; align-items: center; gap: 6px; }
+        .feed-time { font-size: 11px; color: #94a3b8; }
+        .feed-actions { display: flex; gap: 6px; align-items: center; }
 
+        .text-content { font-size: 13px; line-height: 1.5; color: #1e293b; word-break: break-word; white-space: pre-wrap; }
         .text-link { color: #2563eb; text-decoration: underline; word-break: break-all; }
         
-        .code-wrapper { position: relative; margin: 8px 0; border-radius: 6px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
+        .code-wrapper { margin: 6px 0; border-radius: 6px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
         .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 4px 10px; font-size: 11px; color: #94a3b8; font-family: monospace; }
         .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer; }
         .copy-btn:active { background: #334155; }
-        .code-block { color: #f8fafc; padding: 10px; font-family: Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace; font-size: 12px; line-height: 1.4; overflow-x: auto; max-height: 300px; white-space: pre; word-break: normal; word-wrap: normal; -webkit-overflow-scrolling: touch; }
-        .inline-code { background: #e2e8f0; color: #0f172a; padding: 2px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
+        .code-block { color: #f8fafc; padding: 10px; font-family: Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; word-wrap: normal; -webkit-overflow-scrolling: touch; }
+        .inline-code { background: #f1f5f9; color: #0f172a; border: 1px solid #e2e8f0; padding: 1px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
 
-        .file-preview { margin: 6px 0; max-width: 100%; text-align: center; background: #edf2f7; border-radius: 6px; overflow: hidden; }
-        .preview-img { max-width: 100%; max-height: 200px; display: block; margin: 0 auto; object-fit: contain; }
+        .expandable-block { position: relative; max-height: 220px; overflow: hidden; transition: max-height 0.2s ease; }
+        .expandable-block.expanded { max-height: none !important; }
+        .expandable-overlay { position: absolute; bottom: 0; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,1)); pointer-events: none; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 4px; }
+        .expandable-block.expanded .expandable-overlay { display: none; }
+        .expand-toggle-btn { background: #ffffff; border: 1px solid #cbd5e1; color: #0f172a; font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 12px; cursor: pointer; pointer-events: auto; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
 
-        .dl-btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; background: #0f172a; color: #ffffff; text-decoration: none; border-radius: 4px; font-size: 11px; font-weight: 500; margin-top: 4px; }
+        .file-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #f8fafc; border: 1px solid #e2e8f0; padding: 8px 10px; border-radius: 6px; }
+        .file-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+        .file-title { font-weight: 600; font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-size { font-size: 11px; color: #64748b; }
+
+        .file-preview { margin-top: 4px; text-align: center; background: #0f172a; border-radius: 6px; overflow: hidden; max-height: 240px; display: flex; align-items: center; justify-content: center; }
+        .preview-img { max-width: 100%; max-height: 240px; object-fit: contain; display: block; }
+
+        .action-btn { background: #ffffff; border: 1px solid #cbd5e1; color: #334155; padding: 4px 8px; font-size: 11px; border-radius: 4px; font-weight: 500; height: 26px; }
+        .action-btn:active { background: #f1f5f9; }
 
         #log-container { font-family: monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
         .log-entry { padding: 4px 6px; border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.3; }
@@ -383,7 +398,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
 
                 <div id="progress-wrap" style="display:none;">
-                    <div class="row" style="justify-space-between;font-size:11px;color:#64748b;">
+                    <div class="row" style="justify-content:space-between;font-size:11px;color:#64748b;">
                         <span id="send-status">Sending</span>
                         <span id="send-pct">0%</span>
                     </div>
@@ -522,7 +537,7 @@ function renderFormattedContent(text, textId) {
 
 function copyFullText(textId, btnElement) {
     var rawText = textStore[textId] || "";
-    copyToClipboard(rawText, btnElement, "Copied All!");
+    copyToClipboard(rawText, btnElement, "Copied!");
 }
 
 function copyCodeBlock(textId, codeIndex, btnElement) {
@@ -572,6 +587,31 @@ function showCopySuccess(btnElement, msg) {
         btnElement.style.background = "transparent";
         btnElement.style.color = "#cbd5e1";
     }, 1500);
+}
+
+function toggleExpand(blockId, btnElement) {
+    var el = document.getElementById(blockId);
+    if (!el) return;
+    if (el.classList.contains("expanded")) {
+        el.classList.remove("expanded");
+        btnElement.textContent = "Show More";
+    } else {
+        el.classList.add("expanded");
+        btnElement.textContent = "Show Less";
+    }
+}
+
+function checkAutoExpand(blockId, overlayId) {
+    setTimeout(function() {
+        var el = document.getElementById(blockId);
+        var overlay = document.getElementById(overlayId);
+        if (el && overlay) {
+            if (el.scrollHeight <= 230) {
+                overlay.style.display = "none";
+                el.style.maxHeight = "none";
+            }
+        }
+    }, 50);
 }
 
 function generateTransferId() {
@@ -952,25 +992,49 @@ function addReceived(type, data, sender) {
     var now = new Date();
     var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2);
 
-    var actionHtml = "";
+    var headerHtml = '<div class="feed-header">' +
+        '<div class="feed-author">' +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+            '<span>' + escapeHtml(sender) + '</span>' +
+        '</div>' +
+        '<span class="feed-time">' + time + '</span>' +
+    '</div>';
+
+    var bodyHtml = "";
     if (type === "text") {
         var textId = "txt_" + generateTransferId();
+        var blockId = "block_" + textId;
+        var overlayId = "overlay_" + textId;
         var formatted = renderFormattedContent(data, textId);
-        actionHtml = '<div class="feed-body">' + formatted + '</div>' +
-        '<button class="flat icon-only" onclick="copyFullText(\'' + textId + '\', this)" title="Copy All Text" style="width:26px;height:26px;padding:4px;">' +
-            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
-        '</button>';
+
+        bodyHtml = '<div class="expandable-block" id="' + blockId + '">' +
+            '<div class="text-content">' + formatted + '</div>' +
+            '<div class="expandable-overlay" id="' + overlayId + '">' +
+                '<button class="expand-toggle-btn" onclick="toggleExpand(\'' + blockId + '\', this)">Show More</button>' +
+            '</div>' +
+        '</div>' +
+        '<div class="feed-actions" style="justify-content:flex-end;">' +
+            '<button class="action-btn" onclick="copyFullText(\'' + textId + '\', this)">Copy All</button>' +
+        '</div>';
+
+        checkAutoExpand(blockId, overlayId);
     } else {
         var isImage = data.type && data.type.indexOf("image/") === 0;
         var previewHtml = isImage ? '<div class="file-preview"><img src="' + data.url + '" class="preview-img" alt="preview" /></div>' : '';
-        actionHtml = '<div class="feed-body"><b>' + escapeHtml(data.name) + '</b> <span style="font-size:11px;color:#64748b;">(' + formatBytes(data.size) + ')</span></div>' + previewHtml +
-        '<a href="' + data.url + '" download="' + escapeHtml(data.name) + '" class="dl-btn">' +
-            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
-            'Download' +
-        '</a>';
+
+        bodyHtml = '<div class="file-card">' +
+            '<div class="file-meta">' +
+                '<span class="file-title" title="' + escapeHtml(data.name) + '">' + escapeHtml(data.name) + '</span>' +
+                '<span class="file-size">' + formatBytes(data.size) + '</span>' +
+            '</div>' +
+            '<a href="' + data.url + '" download="' + escapeHtml(data.name) + '" class="action-btn" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">' +
+                '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+                'Download' +
+            '</a>' +
+        '</div>' + previewHtml;
     }
 
-    li.innerHTML = '<div class="feed-meta"><span>' + escapeHtml(sender) + '</span><span>' + time + '</span></div>' + actionHtml;
+    li.innerHTML = headerHtml + bodyHtml;
     list.insertBefore(li, list.firstChild);
 }
 
@@ -986,7 +1050,7 @@ var dropZone = document.getElementById("drop-zone");
 dropZone.addEventListener("dragover", function(e) { e.preventDefault(); });
 dropZone.addEventListener("drop", function(e) {
     e.preventDefault();
-    handleFileSelect({ target: { files: e.dataTransfer.files } });
+    handleFileSelect({ target: { files: e.target.files || e.dataTransfer.files } });
 });
 
 window.onload = initSocket;
