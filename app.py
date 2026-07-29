@@ -206,35 +206,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>PairMe</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>PairMe - Fast Cross-Device File & Text Sharing</title>
+    
+    <meta name="description" content="Seamless peer-to-peer file transfer and real-time text sharing between all your devices over local network and internet.">
+    <meta name="keywords" content="file share, pairme, p2p transfer, cross platform transfer, local share, web sharing">
+    <meta name="theme-color" content="#ffffff">
+    
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="PairMe - Fast Cross-Device Sharing">
+    <meta property="og:description" content="Share text, links, code, and files instantly across mobile and desktop devices.">
+    <meta property="og:image" content="https://imgg.fr/r/qVsZ8JGy.png">
+    
+    <link rel="icon" type="image/png" href="https://imgg.fr/r/qVsZ8JGy.png">
+    <link rel="apple-touch-icon" href="https://imgg.fr/r/qVsZ8JGy.png">
+
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
-        html, body { height: 100%; width: 100%; background: #f8fafc; color: #0f172a; overflow: hidden; -webkit-text-size-adjust: 100%; }
-        body { display: flex; flex-direction: column; }
+        body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; }
         
-        header { background: #ffffff; padding: 10px 14px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; height: 48px; }
-        .brand { font-size: 16px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; display: flex; align-items: center; gap: 6px; }
+        header { background: #ffffff; padding: 10px 16px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+        .brand { font-size: 16px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
+        .brand img { width: 22px; height: 22px; border-radius: 4px; object-fit: cover; }
         .room-tag { background: #f1f5f9; color: #475569; padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 4px; }
 
-        .mobile-nav { display: none; background: #ffffff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; height: 42px; }
-        .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 8px 0; color: #64748b; font-size: 13px; font-weight: 600; border-radius: 0; }
+        .mobile-nav { display: none; background: #ffffff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; }
+        .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 10px 0; color: #64748b; font-size: 13px; font-weight: 600; border-radius: 0; }
         .mobile-nav button.active { color: #0f172a; border-bottom-color: #0f172a; background: transparent; }
 
-        .app-grid { display: grid; grid-template-columns: 280px 1fr 300px; gap: 12px; padding: 12px; height: calc(100% - 48px); flex: 1; overflow: hidden; }
+        .app-grid { display: grid; grid-template-columns: 280px 1fr 300px; gap: 12px; padding: 12px; height: calc(100vh - 53px); flex: 1; overflow: hidden; }
         .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; height: 100%; }
         .card-header { padding: 10px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; background: #ffffff; flex-shrink: 0; }
         .card-body { padding: 12px; flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 10px; }
 
-        input, select, textarea { font-size: 16px; border-radius: 6px; border: 1px solid #cbd5e1; background: #ffffff; color: #0f172a; padding: 8px 10px; outline: none; -webkit-appearance: none; appearance: none; }
-        @media (min-width: 769px) { input, select, textarea { font-size: 13px; } }
+        input, select, textarea { font-size: 13px; border-radius: 6px; border: 1px solid #cbd5e1; background: #ffffff; color: #0f172a; padding: 8px 10px; outline: none; -webkit-appearance: none; appearance: none; }
         input:focus, select:focus, textarea:focus { border-color: #0f172a; }
         
         button { background: #0f172a; color: #ffffff; border: 1px solid #0f172a; border-radius: 6px; font-size: 13px; font-weight: 500; padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-appearance: none; }
         button:active { opacity: 0.8; }
         button.flat { background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; }
-        button.icon-only { padding: 8px; width: 36px; height: 36px; flex-shrink: 0; }
+        button.icon-only { padding: 8px; width: 34px; height: 34px; flex-shrink: 0; }
 
         .row { display: flex; gap: 8px; align-items: center; }
         .flex-1 { flex: 1; min-width: 0; }
@@ -245,26 +257,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .peer-name { font-weight: 600; font-size: 13px; color: #0f172a; }
         .peer-id { font-size: 11px; color: #94a3b8; font-family: monospace; }
 
-        .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 14px; text-align: center; color: #64748b; cursor: pointer; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
+        .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 16px; text-align: center; color: #64748b; cursor: pointer; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
 
         .feed-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
         .feed-item { background: #f8fafc; border: 1px solid #e2e8f0; padding: 10px; border-radius: 6px; font-size: 13px; }
         .feed-meta { font-size: 11px; color: #64748b; margin-bottom: 6px; display: flex; justify-content: space-between; }
-        .feed-body { word-break: break-word; white-space: pre-wrap; color: #1e293b; font-size: 13px; line-height: 1.4; }
+        .feed-body { word-break: break-word; white-space: pre-wrap; margin-bottom: 6px; color: #1e293b; font-size: 13px; line-height: 1.4; }
 
         .text-link { color: #2563eb; text-decoration: underline; word-break: break-all; }
-        .inline-code { background: #e2e8f0; color: #0f172a; padding: 2px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
         
-        .code-wrapper { position: relative; margin: 6px 0; border-radius: 6px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
+        .code-wrapper { position: relative; margin: 8px 0; border-radius: 6px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
         .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 4px 10px; font-size: 11px; color: #94a3b8; font-family: monospace; }
         .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer; }
         .copy-btn:active { background: #334155; }
-        .code-block { color: #f8fafc; padding: 8px 10px; font-family: Consolas, Monaco, "Andale Mono", monospace; font-size: 12px; line-height: 1.4; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
+        .code-block { color: #f8fafc; padding: 10px; font-family: Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace; font-size: 12px; line-height: 1.4; overflow-x: auto; max-height: 300px; white-space: pre; word-break: normal; word-wrap: normal; -webkit-overflow-scrolling: touch; }
+        .inline-code { background: #e2e8f0; color: #0f172a; padding: 2px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
 
-        .file-preview { margin: 6px 0; max-width: 100%; text-align: center; background: #e2e8f0; border-radius: 6px; overflow: hidden; display: flex; justify-content: center; align-items: center; }
-        .preview-img { max-width: 100%; max-height: 220px; display: block; object-fit: contain; }
+        .file-preview { margin: 6px 0; max-width: 100%; text-align: center; background: #edf2f7; border-radius: 6px; overflow: hidden; }
+        .preview-img { max-width: 100%; max-height: 200px; display: block; margin: 0 auto; object-fit: contain; }
 
-        .dl-btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; background: #0f172a; color: #ffffff; text-decoration: none; border-radius: 4px; font-size: 11px; font-weight: 500; margin-top: 6px; }
+        .dl-btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; background: #0f172a; color: #ffffff; text-decoration: none; border-radius: 4px; font-size: 11px; font-weight: 500; margin-top: 4px; }
 
         #log-container { font-family: monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
         .log-entry { padding: 4px 6px; border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.3; }
@@ -284,9 +296,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .modal { background: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; width: 100%; max-width: 300px; text-align: center; }
 
         @media (max-width: 768px) {
+            body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
-            .app-grid { display: flex; flex-direction: column; height: calc(100% - 90px); padding: 8px; grid-template-columns: none; overflow: hidden; }
-            .card { display: none; height: 100%; }
+            .app-grid { display: flex; flex-direction: column; height: auto; padding: 8px; grid-template-columns: none; overflow: visible; }
+            .card { display: none; height: auto; min-height: calc(100vh - 110px); }
             .card.mobile-active { display: flex; }
         }
     </style>
@@ -295,7 +308,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <header>
         <div class="brand">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M16 16l4-4-4-4M8 8l-4 4 4 4"/></svg>
+            <img src="https://imgg.fr/r/qVsZ8JGy.png" alt="Logo">
             PairMe
         </div>
         <div class="room-tag" id="room-badge">
@@ -370,7 +383,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
 
                 <div id="progress-wrap" style="display:none;">
-                    <div class="row" style="justify-content:space-between;font-size:11px;color:#64748b;">
+                    <div class="row" style="justify-space-between;font-size:11px;color:#64748b;">
                         <span id="send-status">Sending</span>
                         <span id="send-pct">0%</span>
                     </div>
@@ -710,7 +723,6 @@ function getOrCreateConnection(targetSid, isInitiator) {
     pc.iceQueue = [];
     pc.targetSid = targetSid;
     pc.receiveBuffer = {};
-    pc.receiveMeta = {};
 
     pc.onicecandidate = function(e) {
         if (e.candidate) {
@@ -902,27 +914,23 @@ function handleDataMessage(data, fromSid) {
             addReceived("text", msg.c, fromSid);
         } else if (msg.t === "fs") {
             var pc = connections[fromSid];
-            if (!pc.receiveMeta) pc.receiveMeta = {};
-            pc.receiveMeta[msg.id] = msg;
+            pc.activeMeta = msg;
             pc.receiveBuffer[msg.id] = [];
-            pc.activeTransferId = msg.id;
         } else if (msg.t === "fe") {
             var pc = connections[fromSid];
-            var meta = pc.receiveMeta ? pc.receiveMeta[msg.id] : null;
             var buffers = pc.receiveBuffer[msg.id];
-            if (meta && buffers) {
-                var blob = new Blob(buffers, { type: meta.m });
+            if (buffers) {
+                var blob = new Blob(buffers, { type: pc.activeMeta.m });
                 var url = URL.createObjectURL(blob);
-                addReceived("file", { name: meta.n, size: meta.s, url: url, type: meta.m }, fromSid);
-                log("Received " + meta.n, "success");
+                addReceived("file", { name: pc.activeMeta.n, size: pc.activeMeta.s, url: url, type: pc.activeMeta.m }, fromSid);
+                log("Received " + pc.activeMeta.n, "success");
                 delete pc.receiveBuffer[msg.id];
-                delete pc.receiveMeta[msg.id];
             }
         }
     } else {
         var pc = connections[fromSid];
-        if (pc && pc.activeTransferId && pc.receiveBuffer[pc.activeTransferId]) {
-            pc.receiveBuffer[pc.activeTransferId].push(data);
+        if (pc && pc.activeMeta && pc.receiveBuffer[pc.activeMeta.id]) {
+            pc.receiveBuffer[pc.activeMeta.id].push(data);
         }
     }
 }
@@ -937,7 +945,7 @@ function addReceived(type, data, sender) {
     var actionHtml = "";
     if (type === "text") {
         actionHtml = '<div class="feed-body">' + formatText(data) + '</div>' +
-        '<button class="flat icon-only" onclick="navigator.clipboard.writeText(\'' + escapeJsString(data) + '\')" title="Copy" style="width:26px;height:26px;padding:4px;margin-top:4px;">' +
+        '<button class="flat icon-only" onclick="navigator.clipboard.writeText(\'' + escapeJsString(data) + '\')" title="Copy" style="width:26px;height:26px;padding:4px;">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
         '</button>';
     } else {
