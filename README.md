@@ -35,31 +35,35 @@ PairMe enables instant peer-to-peer file transfers and direct message/code shari
 ### Installation
 
 1. Clone the repository:
-   ```bash
-   git clone [https://github.com/itskevinz/pairme.git](https://github.com/itskevinz/pairme.git)
-   cd pairme
+ ```bash
+ git clone https://github.com/itskevinz/pairme.git
+ cd pairme
+ ```
 
-```
 
 2. Install dependencies:
 ```bash
 pip install flask flask-socketio gevent gevent-websocket
-
 ```
+
+
 
 
 3. Run the application:
 ```bash
 python app.py
-
 ```
+
+
 
 
 4. Open your browser and navigate to:
+
 ```text
 http://localhost:5000
-
 ```
+
+
 
 
 
