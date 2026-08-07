@@ -24,7 +24,13 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", ping_tim
 # ============================================================================
 ENCRYPTION_KEY = secrets.token_bytes(32)  # AES-256 key
 AES_GCM_NONCE_SIZE = 12
-DB_PATH = os.environ.get("DATABASE_URL", "pairme_secure.db").replace("sqlite:///", "") if os.environ.get("DATABASE_URL", "").startswith("sqlite") else "pairme_secure.db"
+# Check if running on Vercel (serverless) - SQLite not supported
+IS_VERCEL = os.environ.get("VERCEL") == "1"
+if IS_VERCEL:
+    log.warning("Running on Vercel - SQLite disabled. Using in-memory storage only.")
+    DB_PATH = ":memory:"
+else:
+    DB_PATH = os.environ.get("DATABASE_URL", "pairme_secure.db").replace("sqlite:///", "") if os.environ.get("DATABASE_URL", "").startswith("sqlite") else "pairme_secure.db"
 MAX_OFFLINE_MESSAGES = 1000
 MESSAGE_TTL_HOURS = 72
 RATE_LIMIT_REQUESTS = 100
@@ -32,40 +38,47 @@ RATE_LIMIT_WINDOW = 60
 
 # ============================================================================
 # KHỞI TẠO DATABASE - LƯU TRỮ TIN NHẮN OFFLINE
+# Note: SQLite not supported on Vercel (serverless filesystem is read-only)
 # ============================================================================
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        device_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        encrypted_payload TEXT NOT NULL,
-        nonce TEXT NOT NULL,
-        message_type TEXT DEFAULT 'text',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        delivered INTEGER DEFAULT 0,
-        expires_at TIMESTAMP NOT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS devices (
-        device_id TEXT PRIMARY KEY,
-        public_key TEXT,
-        fingerprint TEXT,
-        last_seen TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS rate_limits (
-        ip TEXT,
-        endpoint TEXT,
-        count INTEGER DEFAULT 1,
-        reset_at TIMESTAMP,
-        PRIMARY KEY (ip, endpoint)
-    )''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON messages(device_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_delivered ON messages(delivered)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at)')
-    conn.commit()
-    conn.close()
+    if IS_VERCEL:
+        log.info("Skipping SQLite init on Vercel")
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            encrypted_payload TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            message_type TEXT DEFAULT 'text',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivered INTEGER DEFAULT 0,
+            expires_at TIMESTAMP NOT NULL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            public_key TEXT,
+            fingerprint TEXT,
+            last_seen TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS rate_limits (
+            ip TEXT,
+            endpoint TEXT,
+            count INTEGER DEFAULT 1,
+            reset_at TIMESTAMP,
+            PRIMARY KEY (ip, endpoint)
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON messages(device_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_delivered ON messages(delivered)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at)')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"Database initialization failed: {e}")
 
 init_db()
 db_lock = threading.Lock()
@@ -135,6 +148,8 @@ secure_crypto = SecureCrypto()
 # RATE LIMITING - CHỐNG DDoS/SPAM
 # ============================================================================
 def check_rate_limit(ip, endpoint):
+    if IS_VERCEL:
+        return True  # Skip rate limiting on Vercel
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -196,6 +211,8 @@ def generate_device_id(fingerprint=None):
 
 def register_device(device_id, fingerprint, public_key=None):
     """Đăng ký thiết bị vào database"""
+    if IS_VERCEL:
+        return  # Skip on Vercel
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -208,6 +225,8 @@ def register_device(device_id, fingerprint, public_key=None):
 
 def store_offline_message(device_id, sender_id, encrypted_payload, nonce, message_type='text'):
     """Lưu tin nhắn cho thiết bị offline"""
+    if IS_VERCEL:
+        return False  # Not supported on Vercel
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -233,6 +252,8 @@ def store_offline_message(device_id, sender_id, encrypted_payload, nonce, messag
 
 def get_pending_messages(device_id):
     """Lấy tin nhắn chờ cho thiết bị"""
+    if IS_VERCEL:
+        return []  # Not supported on Vercel
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -258,6 +279,8 @@ def get_pending_messages(device_id):
 
 def cleanup_old_messages():
     """Dọn dẹp tin nhắn quá hạn"""
+    if IS_VERCEL:
+        return  # Skip on Vercel
     while True:
         time.sleep(3600)
         with db_lock:
@@ -334,12 +357,13 @@ def fetch_messages_api(device_id):
     messages = get_pending_messages(device_id)
     
     # Cập nhật last_seen
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('UPDATE devices SET last_seen=? WHERE device_id=?', (datetime.now().isoformat(), device_id))
-        conn.commit()
-        conn.close()
+    if not IS_VERCEL:
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE devices SET last_seen=? WHERE device_id=?', (datetime.now().isoformat(), device_id))
+            conn.commit()
+            conn.close()
     
     return jsonify({'messages': messages, 'count': len(messages)})
 
