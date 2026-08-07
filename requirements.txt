@@ -2,3 +2,4 @@ flask
 python-socketio
 gevent
 flask_socketio
+cryptography

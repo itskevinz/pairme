@@ -1,0 +1,17 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database
+pairme_secure.db
+
+# Dependencies
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+```
