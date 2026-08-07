@@ -1,87 +1,65 @@
+# ============================================================================
+# PairMe Secure - Serverless Optimized (Vercel Compatible)
+# No SQLite - Uses in-memory storage with optional Redis
+# End-to-End Encryption: AES-256-GCM + ECDH P-384
+# Device Fingerprint-based Unique Identification
+# ============================================================================
+
 from gevent import monkey
 monkey.patch_all()
 
 from flask import Flask, render_template_string, request, jsonify, make_response
 from flask_socketio import SocketIO, emit, join_room, leave_room
-import uuid, time, random, logging, os, sqlite3, hashlib, json, base64, secrets
+import uuid, time, random, logging, os, hashlib, json, base64, secrets, threading
 from datetime import datetime, timedelta
 from functools import wraps
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, padding
-from cryptography.hazmat.backends import default_backend
-import threading
+from collections import defaultdict
+import hmac
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.backends import default_backend
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pairme")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = secrets.token_hex(32)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", ping_timeout=60, ping_interval=25, max_http_buffer_size=1e8)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", ping_timeout=60, ping_interval=25, max_http_buffer_size=1e8, engineio_logger=False)
 
 # ============================================================================
-# BẢO MẬT TỐI ĐA - CẤU HÌNH
+# CONFIGURATION - OPTIMIZED FOR SERVERLESS/VERCEL
 # ============================================================================
-ENCRYPTION_KEY = secrets.token_bytes(32)  # AES-256 key
+IS_VERCEL = os.environ.get("VERCEL") == "1" or os.environ.get("SERVERLESS") == "1"
+REDIS_URL = os.environ.get("REDIS_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")
+
+# Try to use Redis if available (for production), otherwise in-memory
+USE_REDIS = False
+redis_client = None
+
+if REDIS_URL and not IS_VERCEL:
+    try:
+        import redis
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        USE_REDIS = True
+        log.info(f"Redis connected: {REDIS_URL[:30]}...")
+    except Exception as e:
+        log.warning(f"Redis unavailable, using in-memory: {e}")
+
+# Security Configuration
 AES_GCM_NONCE_SIZE = 12
-# Check if running on Vercel (serverless) - SQLite not supported
-IS_VERCEL = os.environ.get("VERCEL") == "1"
-if IS_VERCEL:
-    log.warning("Running on Vercel - SQLite disabled. Using in-memory storage only.")
-    DB_PATH = ":memory:"
-else:
-    DB_PATH = os.environ.get("DATABASE_URL", "pairme_secure.db").replace("sqlite:///", "") if os.environ.get("DATABASE_URL", "").startswith("sqlite") else "pairme_secure.db"
-MAX_OFFLINE_MESSAGES = 1000
-MESSAGE_TTL_HOURS = 72
+MAX_OFFLINE_MESSAGES = 500
+MESSAGE_TTL_SECONDS = 72 * 3600  # 72 hours
 RATE_LIMIT_REQUESTS = 100
 RATE_LIMIT_WINDOW = 60
+FINGERPRINT_SALT = secrets.token_hex(16)
 
-# ============================================================================
-# KHỞI TẠO DATABASE - LƯU TRỮ TIN NHẮN OFFLINE
-# Note: SQLite not supported on Vercel (serverless filesystem is read-only)
-# ============================================================================
-def init_db():
-    if IS_VERCEL:
-        log.info("Skipping SQLite init on Vercel")
-        return
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT NOT NULL,
-            sender_id TEXT NOT NULL,
-            encrypted_payload TEXT NOT NULL,
-            nonce TEXT NOT NULL,
-            message_type TEXT DEFAULT 'text',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            delivered INTEGER DEFAULT 0,
-            expires_at TIMESTAMP NOT NULL
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            public_key TEXT,
-            fingerprint TEXT,
-            last_seen TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        c.execute('''CREATE TABLE IF NOT EXISTS rate_limits (
-            ip TEXT,
-            endpoint TEXT,
-            count INTEGER DEFAULT 1,
-            reset_at TIMESTAMP,
-            PRIMARY KEY (ip, endpoint)
-        )''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON messages(device_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_delivered ON messages(delivered)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at)')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log.error(f"Database initialization failed: {e}")
-
-init_db()
-db_lock = threading.Lock()
+log.info(f"Running on Vercel: {IS_VERCEL}, Using Redis: {USE_REDIS}")
 
 # ============================================================================
 # MÃ HÓA BẢO MẬT - AES-256-GCM + ECDH
