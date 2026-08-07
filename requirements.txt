@@ -1,5 +1,8 @@
 flask
-python-socketio
+flask-socketio
 gevent
-flask_socketio
+gevent-websocket
 cryptography
+python-engineio
+python-socketio
+werkzeug
