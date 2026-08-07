@@ -1,20 +1,280 @@
 from gevent import monkey
 monkey.patch_all()
 
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, jsonify, make_response
 from flask_socketio import SocketIO, emit, join_room, leave_room
-import uuid, time, random, logging
+import uuid, time, random, logging, os, sqlite3, hashlib, json, base64, secrets
+from datetime import datetime, timedelta
+from functools import wraps
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding
+from cryptography.hazmat.backends import default_backend
+import threading
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pairme")
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "pairme-secret-key"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", ping_timeout=60, ping_interval=25)
+app.config["SECRET_KEY"] = secrets.token_hex(32)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", ping_timeout=60, ping_interval=25, max_http_buffer_size=1e8)
 
+# ============================================================================
+# BẢO MẬT TỐI ĐA - CẤU HÌNH
+# ============================================================================
+ENCRYPTION_KEY = secrets.token_bytes(32)  # AES-256 key
+AES_GCM_NONCE_SIZE = 12
+DB_PATH = os.environ.get("DATABASE_URL", "pairme_secure.db").replace("sqlite:///", "") if os.environ.get("DATABASE_URL", "").startswith("sqlite") else "pairme_secure.db"
+MAX_OFFLINE_MESSAGES = 1000
+MESSAGE_TTL_HOURS = 72
+RATE_LIMIT_REQUESTS = 100
+RATE_LIMIT_WINDOW = 60
+
+# ============================================================================
+# KHỞI TẠO DATABASE - LƯU TRỮ TIN NHẮN OFFLINE
+# ============================================================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        sender_id TEXT NOT NULL,
+        encrypted_payload TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        message_type TEXT DEFAULT 'text',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        delivered INTEGER DEFAULT 0,
+        expires_at TIMESTAMP NOT NULL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS devices (
+        device_id TEXT PRIMARY KEY,
+        public_key TEXT,
+        fingerprint TEXT,
+        last_seen TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS rate_limits (
+        ip TEXT,
+        endpoint TEXT,
+        count INTEGER DEFAULT 1,
+        reset_at TIMESTAMP,
+        PRIMARY KEY (ip, endpoint)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_device_id ON messages(device_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_delivered ON messages(delivered)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at)')
+    conn.commit()
+    conn.close()
+
+init_db()
+db_lock = threading.Lock()
+
+# ============================================================================
+# MÃ HÓA BẢO MẬT - AES-256-GCM + ECDH
+# ============================================================================
+class SecureCrypto:
+    @staticmethod
+    def generate_keypair():
+        """Tạo cặp khóa ECDH P-384 (bảo mật cao hơn P-256)"""
+        private_key = ec.generate_private_key(ec.SECP384R1(), default_backend())
+        public_key = private_key.public_key()
+        return {
+            'private': private_key,
+            'public_pem': public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode()
+        }
+    
+    @staticmethod
+    def derive_shared_secret(private_key, public_key_pem):
+        """Derive shared secret từ ECDH"""
+        try:
+            peer_public = serialization.load_pem_public_key(public_key_pem.encode(), backend=default_backend())
+            shared = private_key.exchange(ec.ECDH(), peer_public)
+            return hashlib.sha256(shared).digest()
+        except Exception as e:
+            log.error(f"Key exchange failed: {e}")
+            return None
+    
+    @staticmethod
+    def encrypt_aes_gcm(plaintext, key):
+        """Mã hóa AES-256-GCM"""
+        try:
+            aesgcm = AESGCM(key if len(key) == 32 else hashlib.sha256(key).digest())
+            nonce = os.urandom(AES_GCM_NONCE_SIZE)
+            ciphertext = aesgcm.encrypt(nonce, plaintext.encode() if isinstance(plaintext, str) else plaintext, None)
+            return base64.b64encode(nonce + ciphertext).decode()
+        except Exception as e:
+            log.error(f"Encryption failed: {e}")
+            return None
+    
+    @staticmethod
+    def decrypt_aes_gcm(encrypted_data, key):
+        """Giải mã AES-256-GCM"""
+        try:
+            data = base64.b64decode(encrypted_data)
+            nonce = data[:AES_GCM_NONCE_SIZE]
+            ciphertext = data[AES_GCM_NONCE_SIZE:]
+            aesgcm = AESGCM(key if len(key) == 32 else hashlib.sha256(key).digest())
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            return plaintext.decode() if isinstance(plaintext, bytes) else plaintext
+        except Exception as e:
+            log.error(f"Decryption failed: {e}")
+            return None
+    
+    @staticmethod
+    def hash_device_fingerprint(fingerprint_data):
+        """Tạo hash SHA-384 cho fingerprint thiết bị"""
+        return hashlib.sha3_384(fingerprint_data.encode()).hexdigest()
+
+secure_crypto = SecureCrypto()
+
+# ============================================================================
+# RATE LIMITING - CHỐNG DDoS/SPAM
+# ============================================================================
+def check_rate_limit(ip, endpoint):
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now = datetime.now()
+        c.execute('SELECT count, reset_at FROM rate_limits WHERE ip=? AND endpoint=?', (ip, endpoint))
+        row = c.fetchone()
+        
+        if row:
+            reset_at = datetime.fromisoformat(row[1])
+            if now >= reset_at:
+                c.execute('INSERT OR REPLACE INTO rate_limits VALUES (?, ?, 1, ?)', 
+                         (ip, endpoint, (now + timedelta(seconds=RATE_LIMIT_WINDOW)).isoformat()))
+                conn.commit()
+                conn.close()
+                return True
+            elif row[0] >= RATE_LIMIT_REQUESTS:
+                conn.close()
+                return False
+            else:
+                c.execute('UPDATE rate_limits SET count=count+1 WHERE ip=? AND endpoint=?', (ip, endpoint))
+                conn.commit()
+                conn.close()
+                return True
+        else:
+            c.execute('INSERT INTO rate_limits VALUES (?, ?, 1, ?)',
+                     (ip, endpoint, (now + timedelta(seconds=RATE_LIMIT_WINDOW)).isoformat()))
+            conn.commit()
+            conn.close()
+            return True
+
+def rate_limit(endpoint):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            ip = request.remote_addr or '127.0.0.1'
+            if not check_rate_limit(ip, endpoint):
+                return jsonify({'error': 'Rate limit exceeded'}), 429
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+# ============================================================================
+# QUẢN LÝ THIẾT BỊ & ĐỊNH DANH DUY NHẤT
+# ============================================================================
 peers = {}
 rooms = {}
+device_keypairs = {}
 
+def get_client_ip():
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or '127.0.0.1'
+
+def generate_device_id(fingerprint=None):
+    """Tạo ID thiết bị duy nhất từ fingerprint"""
+    if fingerprint:
+        return secure_crypto.hash_device_fingerprint(fingerprint)[:32]
+    return str(uuid.uuid4())[:32]
+
+def register_device(device_id, fingerprint, public_key=None):
+    """Đăng ký thiết bị vào database"""
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO devices 
+                    (device_id, public_key, fingerprint, last_seen) 
+                    VALUES (?, ?, ?, ?)''',
+                 (device_id, public_key, fingerprint, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+
+def store_offline_message(device_id, sender_id, encrypted_payload, nonce, message_type='text'):
+    """Lưu tin nhắn cho thiết bị offline"""
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Xóa tin nhắn cũ quá hạn
+        c.execute('DELETE FROM messages WHERE expires_at < ?', (datetime.now().isoformat(),))
+        
+        # Kiểm tra giới hạn tin nhắn
+        c.execute('SELECT COUNT(*) FROM messages WHERE device_id=? AND delivered=0', (device_id,))
+        count = c.fetchone()[0]
+        if count >= MAX_OFFLINE_MESSAGES:
+            conn.close()
+            return False
+        
+        expires_at = (datetime.now() + timedelta(hours=MESSAGE_TTL_HOURS)).isoformat()
+        c.execute('''INSERT INTO messages 
+                    (device_id, sender_id, encrypted_payload, nonce, message_type, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                 (device_id, sender_id, encrypted_payload, nonce, message_type, expires_at))
+        conn.commit()
+        conn.close()
+        return True
+
+def get_pending_messages(device_id):
+    """Lấy tin nhắn chờ cho thiết bị"""
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''SELECT id, sender_id, encrypted_payload, nonce, message_type, created_at 
+                    FROM messages 
+                    WHERE device_id=? AND delivered=0 
+                    ORDER BY created_at ASC''', (device_id,))
+        messages = []
+        for row in c.fetchall():
+            messages.append({
+                'id': row[0],
+                'sender_id': row[1],
+                'encrypted_payload': row[2],
+                'nonce': row[3],
+                'message_type': row[4],
+                'created_at': row[5]
+            })
+        # Đánh dấu đã giao
+        c.execute('UPDATE messages SET delivered=1 WHERE device_id=?', (device_id,))
+        conn.commit()
+        conn.close()
+        return messages
+
+def cleanup_old_messages():
+    """Dọn dẹp tin nhắn quá hạn"""
+    while True:
+        time.sleep(3600)
+        with db_lock:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('DELETE FROM messages WHERE expires_at < ? OR delivered=1', (datetime.now().isoformat(),))
+            deleted = c.rowcount
+            conn.commit()
+            conn.close()
+            if deleted > 0:
+                log.info(f"Cleaned up {deleted} old messages")
+
+threading.Thread(target=cleanup_old_messages, daemon=True).start()
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 def generate_code():
     return str(random.randint(100000, 999999))
 
@@ -29,37 +289,163 @@ def broadcast_peers():
                 peer_list.append({
                     "sid": other_sid,
                     "id": other_info["id"],
-                    "name": other_info["name"]
+                    "name": other_info["name"],
+                    "device_id": other_info.get("device_id", "")
                 })
         socketio.emit("peers", peer_list, room=sid)
 
+# ============================================================================
+# ROUTES
+# ============================================================================
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route("/api/v1/device/register", methods=["POST"])
+@rate_limit("register")
+def register_device_api():
+    """API đăng ký thiết bị với fingerprint"""
+    data = request.get_json() or {}
+    fingerprint = data.get("fingerprint", "")
+    public_key = data.get("public_key")
+    
+    if not fingerprint:
+        return jsonify({'error': 'Fingerprint required'}), 400
+    
+    device_id = generate_device_id(fingerprint)
+    register_device(device_id, fingerprint, public_key)
+    
+    # Tạo keypair cho thiết bị nếu chưa có
+    if device_id not in device_keypairs:
+        device_keypairs[device_id] = secure_crypto.generate_keypair()
+    
+    response = make_response(jsonify({
+        'device_id': device_id,
+        'public_key': device_keypairs[device_id]['public_pem'],
+        'registered': True
+    }))
+    response.set_cookie('device_id', device_id, httponly=True, secure=True, samesite='Lax', max_age=31536000)
+    return response
+
+@app.route("/api/v1/device/<device_id>/messages", methods=["GET"])
+@rate_limit("fetch_messages")
+def fetch_messages_api(device_id):
+    """API lấy tin nhắn chờ cho thiết bị"""
+    messages = get_pending_messages(device_id)
+    
+    # Cập nhật last_seen
+    with db_lock:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('UPDATE devices SET last_seen=? WHERE device_id=?', (datetime.now().isoformat(), device_id))
+        conn.commit()
+        conn.close()
+    
+    return jsonify({'messages': messages, 'count': len(messages)})
+
+@app.route("/api/v1/send", methods=["POST"])
+@rate_limit("send")
+def send_message_api():
+    """API gửi tin nhắn (store-and-forward)"""
+    data = request.get_json() or {}
+    target_device_id = data.get("to")
+    sender_id = data.get("from")
+    payload = data.get("payload")
+    message_type = data.get("type", 'text')
+    encryption_key = data.get("key")
+    
+    if not all([target_device_id, sender_id, payload]):
+        return jsonify({'error': 'Missing required fields'}), 400
+    
+    # Mã hóa payload
+    if encryption_key:
+        encrypted = secure_crypto.encrypt_aes_gcm(payload, encryption_key)
+        nonce = ""
+    else:
+        encrypted = payload
+        nonce = ""
+    
+    if not encrypted:
+        return jsonify({'error': 'Encryption failed'}), 500
+    
+    # Kiểm tra xem thiết bị đích có online không
+    target_sid = None
+    for sid, info in peers.items():
+        if info.get("device_id") == target_device_id:
+            target_sid = sid
+            break
+    
+    if target_sid and target_sid in peers:
+        # Thiết bị online - gửi trực tiếp qua WebSocket
+        socketio.emit("incoming_message", {
+            'from': sender_id,
+            'payload': encrypted,
+            'nonce': nonce,
+            'type': message_type
+        }, room=target_sid)
+        return jsonify({'status': 'delivered', 'method': 'websocket'})
+    else:
+        # Thiết bị offline - lưu vào queue
+        if store_offline_message(target_device_id, sender_id, encrypted, nonce, message_type):
+            return jsonify({'status': 'queued', 'method': 'offline_storage'})
+        else:
+            return jsonify({'error': 'Message queue full'}), 503
+
+@app.route("/api/v1/health", methods=["GET"])
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+# ============================================================================
+# WEBSOCKET HANDLERS
+# ============================================================================
 @socketio.on("connect")
 def handle_connect():
+    client_ip = get_client_ip()
     peer_id = str(uuid.uuid4())[:8]
+    device_id = request.args.get('device_id') or generate_device_id(client_ip)
+    
     peers[request.sid] = {
         "id": peer_id,
         "name": "Device " + peer_id[-4:].upper(),
         "joined": time.time(),
-        "room": "Lobby"
+        "room": "Lobby",
+        "device_id": device_id,
+        "client_ip": client_ip
     }
+    
+    # Tạo keypair cho session này
+    if device_id not in device_keypairs:
+        device_keypairs[device_id] = secure_crypto.generate_keypair()
+    
     join_room("Lobby")
-    emit("init", {"peer_id": peer_id, "sid": request.sid})
+    emit("init", {
+        "peer_id": peer_id, 
+        "sid": request.sid,
+        "device_id": device_id,
+        "public_key": device_keypairs[device_id]['public_pem']
+    })
+    
+    # Gửi tin nhắn chờ nếu có
+    pending = get_pending_messages(device_id)
+    if pending:
+        emit("pending_messages", {"messages": pending, "count": len(pending)})
+    
+    register_device(device_id, client_ip, device_keypairs[device_id]['public_pem'])
     broadcast_peers()
+    log.info(f"Device connected: {device_id} from {client_ip}")
 
 @socketio.on("disconnect")
 def handle_disconnect():
     sid = request.sid
     if sid in peers:
+        device_id = peers[sid].get("device_id")
         room = peers[sid].get("room")
         if room and room in rooms and sid in rooms[room]:
             rooms[room].remove(sid)
             if not rooms[room]:
                 del rooms[room]
         del peers[sid]
+        log.info(f"Device disconnected: {device_id}")
     broadcast_peers()
 
 @socketio.on("set_name")
@@ -201,6 +587,38 @@ def handle_relay_file_done(data):
             "from": request.sid,
             "transfer_id": data.get("transfer_id")
         }, room=target_sid)
+
+@socketio.on("encrypt_and_send")
+def handle_encrypt_and_send(data):
+    """Gửi tin nhắn đã mã hóa end-to-end"""
+    target_device_id = data.get("to_device")
+    encrypted_payload = data.get("encrypted_payload")
+    nonce = data.get("nonce")
+    message_type = data.get("type", "text")
+    
+    if not all([target_device_id, encrypted_payload]):
+        return
+    
+    # Tìm target SID
+    target_sid = None
+    for sid, info in peers.items():
+        if info.get("device_id") == target_device_id:
+            target_sid = sid
+            break
+    
+    if target_sid:
+        emit("incoming_encrypted_message", {
+            "from": request.sid,
+            "from_device": peers[request.sid].get("device_id"),
+            "encrypted_payload": encrypted_payload,
+            "nonce": nonce,
+            "type": message_type
+        }, room=target_sid)
+    else:
+        # Lưu vào queue nếu offline
+        sender_device = peers[request.sid].get("device_id", "unknown")
+        store_offline_message(target_device_id, sender_device, encrypted_payload, nonce, message_type)
+        emit("message_queued", {"status": "queued_for_delivery"})
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
