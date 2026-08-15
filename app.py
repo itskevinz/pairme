@@ -294,7 +294,10 @@ def handle_broadcast_request(data):
             "file_name": str(data.get("file_name", "file"))[:255],
             "file_size": int(data.get("file_size", 0) or 0),
             "file_type": str(data.get("file_type", ""))[:100],
-            "transfer_id": str(data.get("transfer_id", ""))[:64]
+            "transfer_id": str(data.get("transfer_id", ""))[:64],
+            "batch_id": str(data.get("batch_id", ""))[:64],
+            "batch_total": int(data.get("batch_total", 1) or 1),
+            "batch_index": int(data.get("batch_index", 0) or 0),
         }, room=target_sid)
 
 
@@ -343,7 +346,10 @@ def handle_relay_file_start(data):
             "file_name": str(data.get("file_name", "file"))[:255],
             "file_size": int(data.get("file_size", 0) or 0),
             "file_type": str(data.get("file_type", ""))[:100],
-            "transfer_id": str(data.get("transfer_id", ""))[:64]
+            "transfer_id": str(data.get("transfer_id", ""))[:64],
+            "batch_id": str(data.get("batch_id", ""))[:64],
+            "batch_total": int(data.get("batch_total", 1) or 1),
+            "batch_index": int(data.get("batch_index", 0) or 0),
         }, room=target_sid)
 
 
@@ -401,6 +407,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <link rel="apple-touch-icon" href="https://imgg.fr/r/LkSsr60e.png">
 
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
         body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; }
@@ -471,6 +478,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .action-btn { background: #ffffff; border: 1px solid #cbd5e1; color: #334155; padding: 4px 8px; font-size: 11px; border-radius: 4px; font-weight: 500; height: 26px; }
         .action-btn:active { background: #f1f5f9; }
+        .action-btn.primary { background: #0f172a; color: #fff; border-color: #0f172a; }
+        .action-btn.primary:active { opacity: 0.85; }
+
+        /* Media gallery (batch of images/videos) */
+        .media-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin-top: 4px; }
+        .media-thumb { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #0f172a; cursor: pointer; border: 1px solid #e2e8f0; }
+        .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .media-thumb .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.35); pointer-events: none; }
+        .media-thumb .play-badge svg { width: 22px; height: 22px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
+        .media-thumb .file-badge { position: absolute; bottom: 4px; left: 4px; right: 4px; font-size: 9px; color: #fff; background: rgba(15,23,42,0.7); padding: 2px 4px; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; }
+        .gallery-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
+
+        /* Lightbox */
+        .lightbox { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(15,23,42,0.92); flex-direction: column; align-items: center; justify-content: center; padding: 12px; }
+        .lightbox.open { display: flex; }
+        .lightbox-toolbar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; color: #e2e8f0; font-size: 13px; background: linear-gradient(to bottom, rgba(0,0,0,0.5), transparent); }
+        .lightbox-close, .lightbox-nav { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
+        .lightbox-close:active, .lightbox-nav:active { background: rgba(255,255,255,0.25); }
+        .lightbox-stage { max-width: 96vw; max-height: 78vh; display: flex; align-items: center; justify-content: center; }
+        .lightbox-stage img, .lightbox-stage video { max-width: 96vw; max-height: 78vh; object-fit: contain; border-radius: 4px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+        .lightbox-nav-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; pointer-events: none; padding: 0 8px; }
+        .lightbox-nav-wrap button { pointer-events: auto; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; padding: 0; }
+        .lightbox-counter { font-variant-numeric: tabular-nums; }
 
         #log-container { font-family: monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
         .log-entry { padding: 4px 6px; border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.3; }
@@ -572,8 +603,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                    <span>Tap or drag files here</span>
-                    <input type="file" id="file-input" multiple style="display:none;" onchange="handleFileSelect(event)">
+                    <span>Tap or drag files / photos here</span>
+                    <span style="font-size:11px;color:#94a3b8;">Multi-select → gallery + ZIP download</span>
+                    <input type="file" id="file-input" multiple accept="*/*" style="display:none;" onchange="handleFileSelect(event)">
                 </div>
 
                 <div id="progress-wrap" style="display:none;">
@@ -613,6 +645,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="lightbox" id="lightbox" onclick="if(event.target===this) closeLightbox()">
+        <div class="lightbox-toolbar">
+            <span class="lightbox-counter" id="lightbox-counter">1 / 1</span>
+            <div class="row" style="gap:8px;">
+                <button class="lightbox-nav" id="lightbox-download" onclick="downloadLightboxItem()">Download</button>
+                <button class="lightbox-close" onclick="closeLightbox()">Close</button>
+            </div>
+        </div>
+        <div class="lightbox-nav-wrap">
+            <button class="lightbox-nav" onclick="lightboxNav(-1)" title="Previous">‹</button>
+            <button class="lightbox-nav" onclick="lightboxNav(1)" title="Next">›</button>
+        </div>
+        <div class="lightbox-stage" id="lightbox-stage"></div>
+    </div>
+
 <script>
 var socket = null;
 var mySid = "";
@@ -625,6 +672,10 @@ var relayFileQueue = {};
 var relayBuffer = {};
 var relayMeta = {};
 var textStore = {};
+var batchStore = {};          // batchId -> { sender, items: [], total, cardEl }
+var mediaRegistry = {};       // mediaId -> { url, name, type, size, blob }
+var lightboxItems = [];
+var lightboxIndex = 0;
 var CHUNK_SIZE = 16384;
 var STUN_SERVERS = {
     iceServers: [
@@ -1027,7 +1078,7 @@ function bindSocketEvents() {
     socket.on("relay_file_start", function(data) {
         relayBuffer[data.transfer_id] = {};
         relayMeta[data.transfer_id] = data;
-        log("Receiving " + data.file_name, "info");
+        log("Receiving " + data.file_name + (data.batch_total > 1 ? " (" + ((data.batch_index || 0) + 1) + "/" + data.batch_total + ")" : ""), "info");
     });
 
     socket.on("relay_file_chunk", function(data) {
@@ -1047,7 +1098,16 @@ function bindSocketEvents() {
             var ordered = seqs.map(function(s) { return chunkMap[s]; });
             var blob = new Blob(ordered, { type: meta.file_type });
             var url = URL.createObjectURL(blob);
-            addReceived("file", { name: meta.file_name, size: meta.file_size, url: url, type: meta.file_type }, meta.from_name);
+            addReceived("file", {
+                name: meta.file_name,
+                size: meta.file_size,
+                url: url,
+                type: meta.file_type,
+                blob: blob,
+                batch_id: meta.batch_id || "",
+                batch_total: meta.batch_total || 1,
+                batch_index: meta.batch_index || 0
+            }, meta.from_name);
             log("Received " + meta.file_name, "success");
             delete relayBuffer[data.transfer_id];
             delete relayMeta[data.transfer_id];
@@ -1219,33 +1279,55 @@ function sendTextTo(targetSid, text) {
 }
 
 function handleFileSelect(e) {
-    var files = e.target.files;
-    if (!files.length) return;
+    var files = e.target.files || (e.dataTransfer && e.dataTransfer.files);
+    if (!files || !files.length) return;
     var targetSid = document.getElementById("peer-select").value;
+    var batchId = "b_" + generateTransferId();
+    var fileArr = Array.prototype.slice.call(files);
+    var total = fileArr.length;
 
-    for (var i = 0; i < files.length; i++) {
-        var file = files[i];
+    fileArr.forEach(function(file, idx) {
         if (targetSid) {
-            sendFileTo(targetSid, file);
+            sendFileTo(targetSid, file, batchId, total, idx);
         } else {
-            peerList.forEach(function(p) { sendFileTo(p.sid, file); });
+            peerList.forEach(function(p) { sendFileTo(p.sid, file, batchId, total, idx); });
         }
-    }
+    });
     document.getElementById("file-input").value = "";
+    if (total > 1) log("Queued batch of " + total + " files", "info");
 }
 
-function sendFileTo(targetSid, file) {
+function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
+    batchId = batchId || ("b_" + generateTransferId());
+    batchTotal = batchTotal || 1;
+    batchIndex = (typeof batchIndex === "number") ? batchIndex : 0;
     var transferId = generateTransferId();
+    var meta = {
+        file: file,
+        transfer_id: transferId,
+        batch_id: batchId,
+        batch_total: batchTotal,
+        batch_index: batchIndex
+    };
     var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
     if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
         if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
-        pendingFileQueue[targetSid].push({ file: file, transfer_id: transferId });
+        pendingFileQueue[targetSid].push(meta);
         if (pendingFileQueue[targetSid].length === 1) {
-            socket.emit("broadcast_request", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type, transfer_id: transferId });
+            socket.emit("broadcast_request", {
+                to: targetSid,
+                file_name: file.name,
+                file_size: file.size,
+                file_type: file.type,
+                transfer_id: transferId,
+                batch_id: batchId,
+                batch_total: batchTotal,
+                batch_index: batchIndex
+            });
         }
     } else {
         if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
-        relayFileQueue[targetSid].push({ file: file, transfer_id: transferId });
+        relayFileQueue[targetSid].push(meta);
         if (relayFileQueue[targetSid].length === 1) {
             processRelayQueue(targetSid);
         }
@@ -1256,7 +1338,7 @@ function processRelayQueue(targetSid) {
     var queue = relayFileQueue[targetSid];
     if (!queue || !queue.length) return;
     var item = queue[0];
-    relaySendFile(targetSid, item.file, item.transfer_id, function() {
+    relaySendFile(targetSid, item.file, item.transfer_id, item.batch_id, item.batch_total, item.batch_index, function() {
         queue.shift();
         if (queue.length) processRelayQueue(targetSid);
     });
@@ -1270,13 +1352,23 @@ function startDataTransfer(targetSid, transferId) {
     var pc = connections[targetSid];
     var channel = pc.dataChannel;
 
-    channel.send(JSON.stringify({ t: "fs", n: file.name, s: file.size, m: file.type, id: item.transfer_id }));
+    channel.send(JSON.stringify({
+        t: "fs",
+        n: file.name,
+        s: file.size,
+        m: file.type,
+        id: item.transfer_id,
+        bid: item.batch_id,
+        bt: item.batch_total,
+        bi: item.batch_index
+    }));
 
     var reader = new FileReader();
     reader.onload = function(e) {
         var buffer = e.target.result;
         var offset = 0;
         document.getElementById("progress-wrap").style.display = "block";
+        document.getElementById("send-status").textContent = "Sending " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "");
 
         function sendChunk() {
             while (offset < buffer.byteLength) {
@@ -1295,15 +1387,36 @@ function startDataTransfer(targetSid, transferId) {
             log("Sent " + file.name + " (P2P)", "success");
             setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
             queue.shift();
-            if (queue.length) socket.emit("broadcast_request", { to: targetSid, file_name: queue[0].file.name, file_size: queue[0].file.size, transfer_id: queue[0].transfer_id });
+            if (queue.length) {
+                var next = queue[0];
+                socket.emit("broadcast_request", {
+                    to: targetSid,
+                    file_name: next.file.name,
+                    file_size: next.file.size,
+                    file_type: next.file.type,
+                    transfer_id: next.transfer_id,
+                    batch_id: next.batch_id,
+                    batch_total: next.batch_total,
+                    batch_index: next.batch_index
+                });
+            }
         };
         sendChunk();
     };
     reader.readAsArrayBuffer(file);
 }
 
-function relaySendFile(targetSid, file, transferId, onComplete) {
-    socket.emit("relay_file_start", { to: targetSid, file_name: file.name, file_size: file.size, file_type: file.type, transfer_id: transferId });
+function relaySendFile(targetSid, file, transferId, batchId, batchTotal, batchIndex, onComplete) {
+    socket.emit("relay_file_start", {
+        to: targetSid,
+        file_name: file.name,
+        file_size: file.size,
+        file_type: file.type,
+        transfer_id: transferId,
+        batch_id: batchId || "",
+        batch_total: batchTotal || 1,
+        batch_index: batchIndex || 0
+    });
     var reader = new FileReader();
     reader.onerror = function() {
         log("Failed to read " + file.name, "error");
@@ -1389,10 +1502,19 @@ function handleDataMessage(data, fromSid) {
         } else if (msg.t === "fe") {
             var pc = connections[fromSid];
             var buffers = pc.receiveBuffer[msg.id];
-            if (buffers) {
+            if (buffers && pc.activeMeta) {
                 var blob = new Blob(buffers, { type: pc.activeMeta.m });
                 var url = URL.createObjectURL(blob);
-                addReceived("file", { name: pc.activeMeta.n, size: pc.activeMeta.s, url: url, type: pc.activeMeta.m }, fromSid);
+                addReceived("file", {
+                    name: pc.activeMeta.n,
+                    size: pc.activeMeta.s,
+                    url: url,
+                    type: pc.activeMeta.m,
+                    blob: blob,
+                    batch_id: pc.activeMeta.bid || "",
+                    batch_total: pc.activeMeta.bt || 1,
+                    batch_index: pc.activeMeta.bi || 0
+                }, fromSid);
                 log("Received " + pc.activeMeta.n, "success");
                 delete pc.receiveBuffer[msg.id];
             }
@@ -1405,44 +1527,143 @@ function handleDataMessage(data, fromSid) {
     }
 }
 
-function addReceived(type, data, sender) {
+function isMediaType(type) {
+    if (!type) return false;
+    return type.indexOf("image/") === 0 || type.indexOf("video/") === 0;
+}
+
+function registerMedia(item) {
+    var id = "m_" + generateTransferId();
+    mediaRegistry[id] = item;
+    return id;
+}
+
+function ensureBatchCard(batchId, sender, total) {
+    if (batchStore[batchId] && batchStore[batchId].cardEl) return batchStore[batchId];
     var list = document.getElementById("received-list");
     var li = document.createElement("li");
     li.className = "feed-item";
+    li.dataset.batchId = batchId;
+    var now = new Date();
+    var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2);
+    li.innerHTML =
+        '<div class="feed-header">' +
+            '<div class="feed-author">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                '<span>' + escapeHtml(sender) + '</span>' +
+            '</div>' +
+            '<span class="feed-time">' + time + '</span>' +
+        '</div>' +
+        '<div class="gallery-meta" id="batch-meta-' + batchId + '">Receiving 0 / ' + total + '…</div>' +
+        '<div class="media-gallery" id="batch-grid-' + batchId + '"></div>' +
+        '<div class="gallery-actions" id="batch-actions-' + batchId + '" style="display:none;">' +
+            '<button class="action-btn" onclick="downloadBatchIndividual(\'' + batchId + '\')">Download all</button>' +
+            '<button class="action-btn primary" onclick="downloadBatchZip(\'' + batchId + '\')">Download ZIP</button>' +
+        '</div>';
+    list.insertBefore(li, list.firstChild);
+    batchStore[batchId] = { sender: sender, items: [], total: total, cardEl: li, mediaIds: [] };
+    return batchStore[batchId];
+}
+
+function addMediaToBatch(batchId, item, sender) {
+    var total = item.batch_total || 1;
+    var batch = ensureBatchCard(batchId, sender, total);
+    var mediaId = registerMedia(item);
+    batch.mediaIds.push(mediaId);
+    batch.items.push(item);
+
+    var grid = document.getElementById("batch-grid-" + batchId);
+    var thumb = document.createElement("div");
+    thumb.className = "media-thumb";
+    thumb.onclick = function() { openLightbox(batch.mediaIds, batch.mediaIds.indexOf(mediaId)); };
+
+    if (item.type && item.type.indexOf("image/") === 0) {
+        thumb.innerHTML = '<img src="' + item.url + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
+    } else if (item.type && item.type.indexOf("video/") === 0) {
+        thumb.innerHTML =
+            '<video src="' + item.url + '" muted preload="metadata"></video>' +
+            '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
+    } else {
+        thumb.innerHTML = '<div class="file-badge">' + escapeHtml(item.name) + '</div>';
+    }
+    grid.appendChild(thumb);
+
+    var metaEl = document.getElementById("batch-meta-" + batchId);
+    var done = batch.items.length;
+    if (done >= total) {
+        metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " + formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+        document.getElementById("batch-actions-" + batchId).style.display = "flex";
+    } else {
+        metaEl.textContent = "Receiving " + done + " / " + total + "…";
+    }
+}
+
+function addReceived(type, data, sender) {
+    var list = document.getElementById("received-list");
     var now = new Date();
     var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2);
 
-    var headerHtml = '<div class="feed-header">' +
-        '<div class="feed-author">' +
-            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-            '<span>' + escapeHtml(sender) + '</span>' +
-        '</div>' +
-        '<span class="feed-time">' + time + '</span>' +
-    '</div>';
-
-    var bodyHtml = "";
     if (type === "text") {
+        var li = document.createElement("li");
+        li.className = "feed-item";
         var textId = "txt_" + generateTransferId();
         var blockId = "block_" + textId;
         var overlayId = "overlay_" + textId;
         var formatted = renderFormattedContent(data, textId);
-
-        bodyHtml = '<div class="expandable-block" id="' + blockId + '">' +
-            '<div class="text-content">' + formatted + '</div>' +
-            '<div class="expandable-overlay" id="' + overlayId + '">' +
-                '<button class="expand-toggle-btn" onclick="toggleExpand(\'' + blockId + '\', this)">Show More</button>' +
+        li.innerHTML =
+            '<div class="feed-header">' +
+                '<div class="feed-author">' +
+                    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                    '<span>' + escapeHtml(sender) + '</span>' +
+                '</div>' +
+                '<span class="feed-time">' + time + '</span>' +
             '</div>' +
-        '</div>' +
-        '<div class="feed-actions" style="justify-content:flex-end;">' +
-            '<button class="action-btn" onclick="copyFullText(\'' + textId + '\', this)">Copy All</button>' +
-        '</div>';
-
+            '<div class="expandable-block" id="' + blockId + '">' +
+                '<div class="text-content">' + formatted + '</div>' +
+                '<div class="expandable-overlay" id="' + overlayId + '">' +
+                    '<button class="expand-toggle-btn" onclick="toggleExpand(\'' + blockId + '\', this)">Show More</button>' +
+                '</div>' +
+            '</div>' +
+            '<div class="feed-actions" style="justify-content:flex-end;">' +
+                '<button class="action-btn" onclick="copyFullText(\'' + textId + '\', this)">Copy All</button>' +
+            '</div>';
+        list.insertBefore(li, list.firstChild);
         checkAutoExpand(blockId, overlayId);
-    } else {
-        var isImage = data.type && data.type.indexOf("image/") === 0;
-        var previewHtml = isImage ? '<div class="file-preview"><img src="' + data.url + '" class="preview-img" alt="preview" /></div>' : '';
+        return;
+    }
 
-        bodyHtml = '<div class="file-card">' +
+    // File / media
+    var batchId = data.batch_id;
+    var batchTotal = data.batch_total || 1;
+
+    // Group media (and multi-file batches) into one gallery card
+    if (batchId && (batchTotal > 1 || isMediaType(data.type))) {
+        addMediaToBatch(batchId, data, sender);
+        return;
+    }
+
+    // Single non-batch file (or single media without batch)
+    var li = document.createElement("li");
+    li.className = "feed-item";
+    var isImage = data.type && data.type.indexOf("image/") === 0;
+    var isVideo = data.type && data.type.indexOf("video/") === 0;
+    var mediaId = registerMedia(data);
+    var previewHtml = "";
+    if (isImage) {
+        previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + data.url + '" class="preview-img" alt="preview" /></div>';
+    } else if (isVideo) {
+        previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + data.url + '" class="preview-img" muted playsinline></video></div>';
+    }
+
+    li.innerHTML =
+        '<div class="feed-header">' +
+            '<div class="feed-author">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                '<span>' + escapeHtml(sender) + '</span>' +
+            '</div>' +
+            '<span class="feed-time">' + time + '</span>' +
+        '</div>' +
+        '<div class="file-card">' +
             '<div class="file-meta">' +
                 '<span class="file-title" title="' + escapeHtml(data.name) + '">' + escapeHtml(data.name) + '</span>' +
                 '<span class="file-size">' + formatBytes(data.size) + '</span>' +
@@ -1452,11 +1673,115 @@ function addReceived(type, data, sender) {
                 'Download' +
             '</a>' +
         '</div>' + previewHtml;
-    }
-
-    li.innerHTML = headerHtml + bodyHtml;
     list.insertBefore(li, list.firstChild);
 }
+
+function openLightbox(mediaIds, startIndex) {
+    lightboxItems = mediaIds.slice();
+    lightboxIndex = Math.max(0, Math.min(startIndex || 0, lightboxItems.length - 1));
+    renderLightbox();
+    document.getElementById("lightbox").classList.add("open");
+    document.body.style.overflow = "hidden";
+}
+
+function closeLightbox() {
+    document.getElementById("lightbox").classList.remove("open");
+    document.getElementById("lightbox-stage").innerHTML = "";
+    document.body.style.overflow = "";
+    lightboxItems = [];
+}
+
+function lightboxNav(delta) {
+    if (!lightboxItems.length) return;
+    lightboxIndex = (lightboxIndex + delta + lightboxItems.length) % lightboxItems.length;
+    renderLightbox();
+}
+
+function renderLightbox() {
+    var id = lightboxItems[lightboxIndex];
+    var item = mediaRegistry[id];
+    if (!item) return;
+    document.getElementById("lightbox-counter").textContent = (lightboxIndex + 1) + " / " + lightboxItems.length;
+    var stage = document.getElementById("lightbox-stage");
+    stage.innerHTML = "";
+    if (item.type && item.type.indexOf("video/") === 0) {
+        var v = document.createElement("video");
+        v.src = item.url;
+        v.controls = true;
+        v.autoplay = true;
+        v.playsInline = true;
+        stage.appendChild(v);
+    } else {
+        var img = document.createElement("img");
+        img.src = item.url;
+        img.alt = item.name || "";
+        stage.appendChild(img);
+    }
+}
+
+function downloadLightboxItem() {
+    var id = lightboxItems[lightboxIndex];
+    var item = mediaRegistry[id];
+    if (!item) return;
+    triggerDownload(item.url, item.name);
+}
+
+function triggerDownload(url, name) {
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name || "file";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+function downloadBatchIndividual(batchId) {
+    var batch = batchStore[batchId];
+    if (!batch) return;
+    batch.items.forEach(function(item, i) {
+        setTimeout(function() { triggerDownload(item.url, item.name); }, i * 350);
+    });
+    log("Downloading " + batch.items.length + " files individually", "info");
+}
+
+function downloadBatchZip(batchId) {
+    var batch = batchStore[batchId];
+    if (!batch || typeof JSZip === "undefined") {
+        log("JSZip not available, falling back to individual downloads", "warn");
+        downloadBatchIndividual(batchId);
+        return;
+    }
+    var btn = document.querySelector('#batch-actions-' + batchId + ' .primary');
+    if (btn) { btn.textContent = "Zipping…"; btn.disabled = true; }
+    var zip = new JSZip();
+    var folder = zip.folder("pairme_" + batchId.slice(-6));
+    var promises = batch.items.map(function(item) {
+        if (item.blob) return Promise.resolve(item.blob).then(function(b) { folder.file(item.name || "file", b); });
+        return fetch(item.url).then(function(r) { return r.blob(); }).then(function(b) { folder.file(item.name || "file", b); });
+    });
+    Promise.all(promises).then(function() {
+        return zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+    }).then(function(content) {
+        var url = URL.createObjectURL(content);
+        triggerDownload(url, "pairme_" + batchId.slice(-6) + ".zip");
+        setTimeout(function() { URL.revokeObjectURL(url); }, 5000);
+        log("ZIP ready (" + batch.items.length + " files)", "success");
+    }).catch(function(err) {
+        log("ZIP failed: " + (err.message || err), "error");
+        downloadBatchIndividual(batchId);
+    }).finally(function() {
+        if (btn) { btn.textContent = "Download ZIP"; btn.disabled = false; }
+    });
+}
+
+document.addEventListener("keydown", function(e) {
+    var lb = document.getElementById("lightbox");
+    if (!lb || !lb.classList.contains("open")) return;
+    if (e.key === "Escape") closeLightbox();
+    if (e.key === "ArrowLeft") lightboxNav(-1);
+    if (e.key === "ArrowRight") lightboxNav(1);
+});
 
 function respondRequest(accepted) {
     document.getElementById("request-modal").style.display = "none";
