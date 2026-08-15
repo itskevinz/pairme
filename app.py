@@ -481,13 +481,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .action-btn.primary { background: #0f172a; color: #fff; border-color: #0f172a; }
         .action-btn.primary:active { opacity: 0.85; }
 
-        /* Media gallery (batch of images/videos) */
+        /* Batch: pure media gallery */
         .media-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin-top: 4px; }
         .media-thumb { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #0f172a; cursor: pointer; border: 1px solid #e2e8f0; }
         .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
         .media-thumb .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.35); pointer-events: none; }
         .media-thumb .play-badge svg { width: 22px; height: 22px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
-        .media-thumb .file-badge { position: absolute; bottom: 4px; left: 4px; right: 4px; font-size: 9px; color: #fff; background: rgba(15,23,42,0.7); padding: 2px 4px; border-radius: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        /* Batch: mixed / list mode (like WeTransfer / LocalSend) */
+        .batch-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+        .batch-file-row { display: flex; align-items: center; gap: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; }
+        .batch-file-thumb { width: 40px; height: 40px; border-radius: 5px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .batch-file-thumb img, .batch-file-thumb video { width: 100%; height: 100%; object-fit: cover; }
+        .batch-file-icon { width: 40px; height: 40px; border-radius: 5px; background: #e2e8f0; color: #475569; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
+        .batch-file-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+        .batch-file-name { font-weight: 600; font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .batch-file-size { font-size: 11px; color: #64748b; }
+
         .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; }
         .gallery-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
 
@@ -1532,6 +1542,20 @@ function isMediaType(type) {
     return type.indexOf("image/") === 0 || type.indexOf("video/") === 0;
 }
 
+function fileExtLabel(name, type) {
+    if (name && name.indexOf(".") > -1) {
+        var ext = name.split(".").pop().toUpperCase();
+        if (ext.length <= 5) return ext;
+    }
+    if (type) {
+        if (type.indexOf("pdf") >= 0) return "PDF";
+        if (type.indexOf("zip") >= 0 || type.indexOf("compressed") >= 0) return "ZIP";
+        if (type.indexOf("audio") === 0) return "AUD";
+        if (type.indexOf("text") === 0) return "TXT";
+    }
+    return "FILE";
+}
+
 function registerMedia(item) {
     var id = "m_" + generateTransferId();
     mediaRegistry[id] = item;
@@ -1546,6 +1570,7 @@ function ensureBatchCard(batchId, sender, total) {
     li.dataset.batchId = batchId;
     var now = new Date();
     var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2);
+    // Start with list container; mode decided when batch completes (or progressively)
     li.innerHTML =
         '<div class="feed-header">' +
             '<div class="feed-author">' +
@@ -1555,46 +1580,132 @@ function ensureBatchCard(batchId, sender, total) {
             '<span class="feed-time">' + time + '</span>' +
         '</div>' +
         '<div class="gallery-meta" id="batch-meta-' + batchId + '">Receiving 0 / ' + total + '…</div>' +
-        '<div class="media-gallery" id="batch-grid-' + batchId + '"></div>' +
+        '<div id="batch-body-' + batchId + '"></div>' +
         '<div class="gallery-actions" id="batch-actions-' + batchId + '" style="display:none;">' +
             '<button class="action-btn" onclick="downloadBatchIndividual(\'' + batchId + '\')">Download all</button>' +
             '<button class="action-btn primary" onclick="downloadBatchZip(\'' + batchId + '\')">Download ZIP</button>' +
         '</div>';
     list.insertBefore(li, list.firstChild);
-    batchStore[batchId] = { sender: sender, items: [], total: total, cardEl: li, mediaIds: [] };
+    batchStore[batchId] = {
+        sender: sender,
+        items: [],
+        total: total,
+        cardEl: li,
+        mediaIds: [],
+        mode: null   // "gallery" | "list" decided after we know composition
+    };
     return batchStore[batchId];
 }
 
-function addMediaToBatch(batchId, item, sender) {
+function decideBatchMode(batch) {
+    // Pure media (all image/video) → gallery grid. Anything mixed or non-media → list.
+    if (!batch.items.length) return "list";
+    var allMedia = batch.items.every(function(it) { return isMediaType(it.type); });
+    return allMedia ? "gallery" : "list";
+}
+
+function renderBatchBody(batchId) {
+    var batch = batchStore[batchId];
+    if (!batch) return;
+    var body = document.getElementById("batch-body-" + batchId);
+    if (!body) return;
+
+    var mode = decideBatchMode(batch);
+    batch.mode = mode;
+    body.innerHTML = "";
+
+    if (mode === "gallery") {
+        var grid = document.createElement("div");
+        grid.className = "media-gallery";
+        batch.mediaIds = [];
+        batch.items.forEach(function(item) {
+            var mediaId = registerMedia(item);
+            batch.mediaIds.push(mediaId);
+            var thumb = document.createElement("div");
+            thumb.className = "media-thumb";
+            (function(mid, ids) {
+                thumb.onclick = function() { openLightbox(ids, ids.indexOf(mid)); };
+            })(mediaId, batch.mediaIds);
+            if (item.type && item.type.indexOf("image/") === 0) {
+                thumb.innerHTML = '<img src="' + item.url + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
+            } else {
+                thumb.innerHTML =
+                    '<video src="' + item.url + '" muted preload="metadata"></video>' +
+                    '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
+            }
+            grid.appendChild(thumb);
+        });
+        body.appendChild(grid);
+    } else {
+        // List mode: every file as a row; media gets small thumbnail + click-to-lightbox
+        var listEl = document.createElement("div");
+        listEl.className = "batch-file-list";
+        batch.mediaIds = [];
+        batch.items.forEach(function(item) {
+            var row = document.createElement("div");
+            row.className = "batch-file-row";
+            var leftHtml = "";
+            if (isMediaType(item.type)) {
+                var mediaId = registerMedia(item);
+                batch.mediaIds.push(mediaId);
+                var thumb = document.createElement("div");
+                thumb.className = "batch-file-thumb";
+                (function(mid) {
+                    thumb.onclick = function() {
+                        var onlyMedia = batch.mediaIds.slice();
+                        openLightbox(onlyMedia, onlyMedia.indexOf(mid));
+                    };
+                })(mediaId);
+                if (item.type.indexOf("image/") === 0) {
+                    thumb.innerHTML = '<img src="' + item.url + '" alt="">';
+                } else {
+                    thumb.innerHTML = '<video src="' + item.url + '" muted preload="metadata"></video>';
+                }
+                row.appendChild(thumb);
+            } else {
+                var icon = document.createElement("div");
+                icon.className = "batch-file-icon";
+                icon.textContent = fileExtLabel(item.name, item.type);
+                row.appendChild(icon);
+            }
+            var meta = document.createElement("div");
+            meta.className = "batch-file-meta";
+            meta.innerHTML =
+                '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span>' +
+                '<span class="batch-file-size">' + formatBytes(item.size) + '</span>';
+            row.appendChild(meta);
+            var dl = document.createElement("a");
+            dl.href = item.url;
+            dl.download = item.name || "file";
+            dl.className = "action-btn";
+            dl.style.textDecoration = "none";
+            dl.textContent = "Download";
+            row.appendChild(dl);
+            listEl.appendChild(row);
+        });
+        body.appendChild(listEl);
+    }
+}
+
+function addToBatch(batchId, item, sender) {
     var total = item.batch_total || 1;
     var batch = ensureBatchCard(batchId, sender, total);
-    var mediaId = registerMedia(item);
-    batch.mediaIds.push(mediaId);
     batch.items.push(item);
-
-    var grid = document.getElementById("batch-grid-" + batchId);
-    var thumb = document.createElement("div");
-    thumb.className = "media-thumb";
-    thumb.onclick = function() { openLightbox(batch.mediaIds, batch.mediaIds.indexOf(mediaId)); };
-
-    if (item.type && item.type.indexOf("image/") === 0) {
-        thumb.innerHTML = '<img src="' + item.url + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
-    } else if (item.type && item.type.indexOf("video/") === 0) {
-        thumb.innerHTML =
-            '<video src="' + item.url + '" muted preload="metadata"></video>' +
-            '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
-    } else {
-        thumb.innerHTML = '<div class="file-badge">' + escapeHtml(item.name) + '</div>';
-    }
-    grid.appendChild(thumb);
 
     var metaEl = document.getElementById("batch-meta-" + batchId);
     var done = batch.items.length;
+
+    // Progressive: while receiving, show list of what we have so far (safer for mixed)
+    // Final mode decided when complete
     if (done >= total) {
-        metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " + formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+        metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " +
+            formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+        renderBatchBody(batchId);
         document.getElementById("batch-actions-" + batchId).style.display = "flex";
     } else {
         metaEl.textContent = "Receiving " + done + " / " + total + "…";
+        // Show provisional list so user sees non-media files immediately
+        renderBatchBody(batchId);
     }
 }
 
@@ -1632,17 +1743,17 @@ function addReceived(type, data, sender) {
         return;
     }
 
-    // File / media
+    // File
     var batchId = data.batch_id;
     var batchTotal = data.batch_total || 1;
 
-    // Group media (and multi-file batches) into one gallery card
-    if (batchId && (batchTotal > 1 || isMediaType(data.type))) {
-        addMediaToBatch(batchId, data, sender);
+    // Multi-file batch → one card, mode depends on content
+    if (batchId && batchTotal > 1) {
+        addToBatch(batchId, data, sender);
         return;
     }
 
-    // Single non-batch file (or single media without batch)
+    // Single file (batch_total 1 or no batch)
     var li = document.createElement("li");
     li.className = "feed-item";
     var isImage = data.type && data.type.indexOf("image/") === 0;
