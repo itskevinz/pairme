@@ -408,6 +408,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
         body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; }
@@ -497,6 +498,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .batch-file-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
         .batch-file-name { font-weight: 600; font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .batch-file-size { font-size: 11px; color: #64748b; }
+        .audio-player-wrap { margin-top: 6px; width: 100%; }
+        .audio-player-wrap audio { width: 100%; height: 36px; border-radius: 6px; }
+        .batch-audio-row audio { width: 100%; max-width: 220px; height: 32px; }
 
         .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; }
         .gallery-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
@@ -1537,9 +1541,58 @@ function handleDataMessage(data, fromSid) {
     }
 }
 
+function guessMimeFromName(name) {
+    if (!name) return "";
+    var ext = (name.split(".").pop() || "").toLowerCase();
+    var map = {
+        heic: "image/heic", heif: "image/heif",
+        jpg: "image/jpeg", jpeg: "image/jpeg", jpe: "image/jpeg",
+        png: "image/png", gif: "image/gif", webp: "image/webp",
+        avif: "image/avif", bmp: "image/bmp", tif: "image/tiff", tiff: "image/tiff",
+        mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", m4v: "video/x-m4v",
+        mkv: "video/x-matroska", avi: "video/x-msvideo",
+        mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac",
+        wav: "audio/wav", ogg: "audio/ogg", oga: "audio/ogg",
+        flac: "audio/flac", opus: "audio/opus", caf: "audio/x-caf",
+        pdf: "application/pdf", zip: "application/zip", txt: "text/plain"
+    };
+    return map[ext] || "";
+}
+
+function normalizeItemMime(item) {
+    if (!item.type || item.type === "application/octet-stream" || item.type === "") {
+        var guessed = guessMimeFromName(item.name);
+        if (guessed) item.type = guessed;
+    }
+    return item;
+}
+
+function isHeicType(type, name) {
+    var t = (type || "").toLowerCase();
+    if (t.indexOf("heic") >= 0 || t.indexOf("heif") >= 0) return true;
+    var n = (name || "").toLowerCase();
+    return n.endsWith(".heic") || n.endsWith(".heif");
+}
+
+function isImageType(type) {
+    return !!(type && type.indexOf("image/") === 0);
+}
+
+function isVideoType(type) {
+    return !!(type && type.indexOf("video/") === 0);
+}
+
+function isAudioType(type) {
+    return !!(type && type.indexOf("audio/") === 0);
+}
+
 function isMediaType(type) {
-    if (!type) return false;
-    return type.indexOf("image/") === 0 || type.indexOf("video/") === 0;
+    // Gallery-only media (images + videos). Audio is playable but not grid-gallery.
+    return isImageType(type) || isVideoType(type);
+}
+
+function isPlayableType(type) {
+    return isMediaType(type) || isAudioType(type);
 }
 
 function fileExtLabel(name, type) {
@@ -1552,6 +1605,7 @@ function fileExtLabel(name, type) {
         if (type.indexOf("zip") >= 0 || type.indexOf("compressed") >= 0) return "ZIP";
         if (type.indexOf("audio") === 0) return "AUD";
         if (type.indexOf("text") === 0) return "TXT";
+        if (type.indexOf("heic") >= 0 || type.indexOf("heif") >= 0) return "HEIC";
     }
     return "FILE";
 }
@@ -1560,6 +1614,46 @@ function registerMedia(item) {
     var id = "m_" + generateTransferId();
     mediaRegistry[id] = item;
     return id;
+}
+
+// Prepare preview URL. For HEIC: convert to JPEG for display (original kept for download).
+// Returns a Promise that resolves to the same item with previewUrl set.
+function prepareItemPreview(item) {
+    return new Promise(function(resolve) {
+        normalizeItemMime(item);
+        item.previewUrl = item.url;
+        item.previewReady = true;
+
+        if (!isHeicType(item.type, item.name)) {
+            resolve(item);
+            return;
+        }
+
+        // Safari can often display HEIC natively; still try conversion for consistency
+        // and for Chrome/Firefox which cannot.
+        if (typeof heic2any === "undefined") {
+            resolve(item);
+            return;
+        }
+
+        var sourceBlob = item.blob;
+        var start = sourceBlob
+            ? Promise.resolve(sourceBlob)
+            : fetch(item.url).then(function(r) { return r.blob(); });
+
+        start.then(function(blob) {
+            return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 });
+        }).then(function(result) {
+            var jpegBlob = Array.isArray(result) ? result[0] : result;
+            item.previewUrl = URL.createObjectURL(jpegBlob);
+            item.previewType = "image/jpeg";
+            item.convertedFromHeic = true;
+            resolve(item);
+        }).catch(function(err) {
+            log("HEIC preview convert failed: " + (err && err.message ? err.message : err), "warn");
+            resolve(item); // fallback: show as file, download still works
+        });
+    });
 }
 
 function ensureBatchCard(batchId, sender, total) {
@@ -1598,10 +1692,14 @@ function ensureBatchCard(batchId, sender, total) {
 }
 
 function decideBatchMode(batch) {
-    // Pure media (all image/video) → gallery grid. Anything mixed or non-media → list.
+    // Pure image/video → gallery grid. Audio or any non-media → list.
     if (!batch.items.length) return "list";
-    var allMedia = batch.items.every(function(it) { return isMediaType(it.type); });
-    return allMedia ? "gallery" : "list";
+    var allVisual = batch.items.every(function(it) { return isMediaType(it.type); });
+    return allVisual ? "gallery" : "list";
+}
+
+function previewSrc(item) {
+    return item.previewUrl || item.url;
 }
 
 function renderBatchBody(batchId) {
@@ -1626,54 +1724,70 @@ function renderBatchBody(batchId) {
             (function(mid, ids) {
                 thumb.onclick = function() { openLightbox(ids, ids.indexOf(mid)); };
             })(mediaId, batch.mediaIds);
-            if (item.type && item.type.indexOf("image/") === 0) {
-                thumb.innerHTML = '<img src="' + item.url + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
-            } else {
+            if (isImageType(item.type) || item.convertedFromHeic) {
+                thumb.innerHTML = '<img src="' + previewSrc(item) + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
+            } else if (isVideoType(item.type)) {
                 thumb.innerHTML =
                     '<video src="' + item.url + '" muted preload="metadata"></video>' +
                     '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
+            } else {
+                thumb.innerHTML = '<div class="batch-file-icon" style="width:100%;height:100%;border-radius:0;">' + fileExtLabel(item.name, item.type) + '</div>';
             }
             grid.appendChild(thumb);
         });
         body.appendChild(grid);
     } else {
-        // List mode: every file as a row; media gets small thumbnail + click-to-lightbox
         var listEl = document.createElement("div");
         listEl.className = "batch-file-list";
         batch.mediaIds = [];
         batch.items.forEach(function(item) {
             var row = document.createElement("div");
             row.className = "batch-file-row";
-            var leftHtml = "";
-            if (isMediaType(item.type)) {
+
+            if (isMediaType(item.type) || item.convertedFromHeic) {
                 var mediaId = registerMedia(item);
                 batch.mediaIds.push(mediaId);
                 var thumb = document.createElement("div");
                 thumb.className = "batch-file-thumb";
                 (function(mid) {
                     thumb.onclick = function() {
-                        var onlyMedia = batch.mediaIds.slice();
-                        openLightbox(onlyMedia, onlyMedia.indexOf(mid));
+                        openLightbox(batch.mediaIds.slice(), batch.mediaIds.indexOf(mid));
                     };
                 })(mediaId);
-                if (item.type.indexOf("image/") === 0) {
-                    thumb.innerHTML = '<img src="' + item.url + '" alt="">';
+                if (isImageType(item.type) || item.convertedFromHeic) {
+                    thumb.innerHTML = '<img src="' + previewSrc(item) + '" alt="">';
                 } else {
                     thumb.innerHTML = '<video src="' + item.url + '" muted preload="metadata"></video>';
                 }
                 row.appendChild(thumb);
-            } else {
+            } else if (isAudioType(item.type)) {
                 var icon = document.createElement("div");
                 icon.className = "batch-file-icon";
-                icon.textContent = fileExtLabel(item.name, item.type);
+                icon.textContent = "AUD";
                 row.appendChild(icon);
+            } else {
+                var icon2 = document.createElement("div");
+                icon2.className = "batch-file-icon";
+                icon2.textContent = fileExtLabel(item.name, item.type);
+                row.appendChild(icon2);
             }
+
             var meta = document.createElement("div");
             meta.className = "batch-file-meta";
+            var nameLine = escapeHtml(item.name);
+            if (item.convertedFromHeic) nameLine += ' <span style="color:#94a3b8;font-weight:400;">(HEIC)</span>';
             meta.innerHTML =
-                '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span>' +
+                '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + nameLine + '</span>' +
                 '<span class="batch-file-size">' + formatBytes(item.size) + '</span>';
             row.appendChild(meta);
+
+            if (isAudioType(item.type)) {
+                var audioWrap = document.createElement("div");
+                audioWrap.className = "batch-audio-row";
+                audioWrap.innerHTML = '<audio controls preload="metadata" src="' + item.url + '"></audio>';
+                row.appendChild(audioWrap);
+            }
+
             var dl = document.createElement("a");
             dl.href = item.url;
             dl.download = item.name || "file";
@@ -1690,23 +1804,22 @@ function renderBatchBody(batchId) {
 function addToBatch(batchId, item, sender) {
     var total = item.batch_total || 1;
     var batch = ensureBatchCard(batchId, sender, total);
-    batch.items.push(item);
 
-    var metaEl = document.getElementById("batch-meta-" + batchId);
-    var done = batch.items.length;
+    prepareItemPreview(item).then(function(ready) {
+        batch.items.push(ready);
+        var metaEl = document.getElementById("batch-meta-" + batchId);
+        var done = batch.items.length;
 
-    // Progressive: while receiving, show list of what we have so far (safer for mixed)
-    // Final mode decided when complete
-    if (done >= total) {
-        metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " +
-            formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
-        renderBatchBody(batchId);
-        document.getElementById("batch-actions-" + batchId).style.display = "flex";
-    } else {
-        metaEl.textContent = "Receiving " + done + " / " + total + "…";
-        // Show provisional list so user sees non-media files immediately
-        renderBatchBody(batchId);
-    }
+        if (done >= total) {
+            metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " +
+                formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+            renderBatchBody(batchId);
+            document.getElementById("batch-actions-" + batchId).style.display = "flex";
+        } else {
+            metaEl.textContent = "Receiving " + done + " / " + total + "…";
+            renderBatchBody(batchId);
+        }
+    });
 }
 
 function addReceived(type, data, sender) {
@@ -1754,37 +1867,40 @@ function addReceived(type, data, sender) {
     }
 
     // Single file (batch_total 1 or no batch)
-    var li = document.createElement("li");
-    li.className = "feed-item";
-    var isImage = data.type && data.type.indexOf("image/") === 0;
-    var isVideo = data.type && data.type.indexOf("video/") === 0;
-    var mediaId = registerMedia(data);
-    var previewHtml = "";
-    if (isImage) {
-        previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + data.url + '" class="preview-img" alt="preview" /></div>';
-    } else if (isVideo) {
-        previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + data.url + '" class="preview-img" muted playsinline></video></div>';
-    }
+    prepareItemPreview(data).then(function(item) {
+        var li = document.createElement("li");
+        li.className = "feed-item";
+        var mediaId = registerMedia(item);
+        var titleExtra = item.convertedFromHeic ? ' <span style="color:#94a3b8;font-weight:400;font-size:11px;">(HEIC → preview)</span>' : '';
+        var previewHtml = "";
+        if (isImageType(item.type) || item.convertedFromHeic) {
+            previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
+        } else if (isVideoType(item.type)) {
+            previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + item.url + '" class="preview-img" muted playsinline></video></div>';
+        } else if (isAudioType(item.type)) {
+            previewHtml = '<div class="audio-player-wrap"><audio controls preload="metadata" src="' + item.url + '"></audio></div>';
+        }
 
-    li.innerHTML =
-        '<div class="feed-header">' +
-            '<div class="feed-author">' +
-                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-                '<span>' + escapeHtml(sender) + '</span>' +
+        li.innerHTML =
+            '<div class="feed-header">' +
+                '<div class="feed-author">' +
+                    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                    '<span>' + escapeHtml(sender) + '</span>' +
+                '</div>' +
+                '<span class="feed-time">' + time + '</span>' +
             '</div>' +
-            '<span class="feed-time">' + time + '</span>' +
-        '</div>' +
-        '<div class="file-card">' +
-            '<div class="file-meta">' +
-                '<span class="file-title" title="' + escapeHtml(data.name) + '">' + escapeHtml(data.name) + '</span>' +
-                '<span class="file-size">' + formatBytes(data.size) + '</span>' +
-            '</div>' +
-            '<a href="' + data.url + '" download="' + escapeHtml(data.name) + '" class="action-btn" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">' +
-                '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
-                'Download' +
-            '</a>' +
-        '</div>' + previewHtml;
-    list.insertBefore(li, list.firstChild);
+            '<div class="file-card">' +
+                '<div class="file-meta">' +
+                    '<span class="file-title" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + titleExtra + '</span>' +
+                    '<span class="file-size">' + formatBytes(item.size) + '</span>' +
+                '</div>' +
+                '<a href="' + item.url + '" download="' + escapeHtml(item.name) + '" class="action-btn" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">' +
+                    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+                    'Download' +
+                '</a>' +
+            '</div>' + previewHtml;
+        list.insertBefore(li, list.firstChild);
+    });
 }
 
 function openLightbox(mediaIds, startIndex) {
@@ -1815,16 +1931,23 @@ function renderLightbox() {
     document.getElementById("lightbox-counter").textContent = (lightboxIndex + 1) + " / " + lightboxItems.length;
     var stage = document.getElementById("lightbox-stage");
     stage.innerHTML = "";
-    if (item.type && item.type.indexOf("video/") === 0) {
+    if (isVideoType(item.type)) {
         var v = document.createElement("video");
         v.src = item.url;
         v.controls = true;
         v.autoplay = true;
         v.playsInline = true;
         stage.appendChild(v);
+    } else if (isAudioType(item.type)) {
+        var a = document.createElement("audio");
+        a.src = item.url;
+        a.controls = true;
+        a.autoplay = true;
+        a.style.width = "min(90vw, 420px)";
+        stage.appendChild(a);
     } else {
         var img = document.createElement("img");
-        img.src = item.url;
+        img.src = previewSrc(item);
         img.alt = item.name || "";
         stage.appendChild(img);
     }
