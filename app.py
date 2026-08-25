@@ -38,6 +38,9 @@ socketio = SocketIO(
 peers = {}                        # sid -> info dict
 rooms_index = defaultdict(set)    # room -> set(sid), O(1) membership
 fp_to_peer_id = {}                # fingerprint hash -> stable peer_id across reconnects
+peer_id_to_sid = {}               # peer_id -> current sid (survives reconnect)
+peer_last_room = {}               # peer_id -> last room (restore on reconnect)
+peer_last_name = {}               # peer_id -> last display name
 rate_buckets = defaultdict(list)  # sid -> [event timestamps] sliding window
 STALE_TTL = 90                    # seconds idle before a dead peer is force-dropped
 CLEANUP_INTERVAL = 30
@@ -48,12 +51,21 @@ MAX_TEXT_LEN = 20000
 MAX_CHUNK_B64_LEN = 400_000       # bounds per-message relay memory (~300KB raw)
 RATE_LIMIT_WINDOW = 5.0
 RATE_LIMIT_MAX_EVENTS = 60
-FILECHUNK_RATE_LIMIT = 400   # generous abuse ceiling; real pacing comes from client ack window
+FILECHUNK_RATE_LIMIT = 900   # higher ceiling for concurrent chunk streams
 FILECHUNK_WINDOW = 5.0
 
 
 def generate_code():
     return str(random.randint(100000, 999999))
+
+
+def resolve_target_sid(to):
+    """Accept either a live sid or a stable peer_id; return current sid or None."""
+    if not to:
+        return None
+    if to in peers:
+        return to
+    return peer_id_to_sid.get(to)
 
 
 def rate_limited(sid, weight=1, bucket="default", limit=RATE_LIMIT_MAX_EVENTS, window=RATE_LIMIT_WINDOW):
@@ -133,10 +145,14 @@ def cleanup_stale_peers():
         stale = [sid for sid, info in peers.items() if now - info.get("last_seen", now) > STALE_TTL]
         for sid in stale:
             log.info("dropping stale peer sid=%s", sid)
-            room = peers.get(sid, {}).get("room")
+            info = peers.get(sid, {})
+            room = info.get("room")
+            peer_id = info.get("id")
             leave_current_room(sid)
             peers.pop(sid, None)
             drop_rate_buckets(sid)
+            if peer_id and peer_id_to_sid.get(peer_id) == sid:
+                del peer_id_to_sid[peer_id]
             if room:
                 broadcast_peers(room)
 
@@ -163,27 +179,35 @@ def handle_connect():
         if fp:
             fp_to_peer_id[fp] = peer_id
 
+    room = peer_last_room.get(peer_id, "Lobby")
+    name = peer_last_name.get(peer_id, "Device " + peer_id[-4:].upper())
+
     peers[sid] = {
         "id": peer_id,
-        "name": "Device " + peer_id[-4:].upper(),
+        "name": name,
         "joined": time.time(),
         "last_seen": time.time(),
-        "room": "Lobby",
+        "room": room,
         "fp": fp,
     }
-    join_room("Lobby")
-    rooms_index["Lobby"].add(sid)
-    emit("init", {"peer_id": peer_id, "sid": sid})
-    broadcast_peers("Lobby")
+    peer_id_to_sid[peer_id] = sid
+    join_room(room)
+    rooms_index[room].add(sid)
+    emit("init", {"peer_id": peer_id, "sid": sid, "room": room, "name": name})
+    broadcast_peers(room)
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
     sid = request.sid
-    room = peers.get(sid, {}).get("room")
+    info = peers.get(sid, {})
+    room = info.get("room")
+    peer_id = info.get("id")
     leave_current_room(sid)
     peers.pop(sid, None)
     drop_rate_buckets(sid)
+    if peer_id and peer_id_to_sid.get(peer_id) == sid:
+        del peer_id_to_sid[peer_id]
     if room:
         broadcast_peers(room)
 
@@ -197,6 +221,7 @@ def handle_set_name(data):
     raw = str(data.get("name", "")).strip()
     if raw and NAME_RE.match(raw):
         peers[sid]["name"] = raw
+        peer_last_name[peers[sid]["id"]] = raw
         broadcast_peers(peers[sid]["room"])
 
 
@@ -214,6 +239,7 @@ def handle_join_room_code(data):
     leave_current_room(sid)
     join_room(code)
     peers[sid]["room"] = code
+    peer_last_room[peers[sid]["id"]] = code
     rooms_index[code].add(sid)
     emit("room_joined", {"code": code})
     broadcast_peers(code)
@@ -234,6 +260,7 @@ def handle_create_room_code():
     leave_current_room(sid)
     join_room(code)
     peers[sid]["room"] = code
+    peer_last_room[peers[sid]["id"]] = code
     rooms_index[code] = {sid}
     emit("room_joined", {"code": code})
     broadcast_peers(code)
@@ -251,6 +278,7 @@ def handle_leave_room_code():
     leave_current_room(sid)
     join_room("Lobby")
     peers[sid]["room"] = "Lobby"
+    peer_last_room[peers[sid]["id"]] = "Lobby"
     rooms_index["Lobby"].add(sid)
     emit("room_left", {})
     broadcast_peers("Lobby")
@@ -269,7 +297,7 @@ def handle_signal(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     if target_sid in peers and _same_room(sid, target_sid):
         emit("signal", {
             "from": sid,
@@ -285,7 +313,7 @@ def handle_broadcast_request(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     if target_sid in peers and _same_room(sid, target_sid):
         emit("transfer_request", {
             "from": sid,
@@ -307,7 +335,7 @@ def handle_broadcast_response(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     if target_sid in peers and _same_room(sid, target_sid):
         emit("transfer_response", {
             "from": sid,
@@ -322,7 +350,7 @@ def handle_relay_text(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     text = str(data.get("text", ""))[:MAX_TEXT_LEN]
     if target_sid in peers and _same_room(sid, target_sid):
         emit("relay_text", {
@@ -338,7 +366,7 @@ def handle_relay_file_start(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     if target_sid in peers and _same_room(sid, target_sid):
         emit("relay_file_start", {
             "from": sid,
@@ -359,7 +387,7 @@ def handle_relay_file_chunk(data):
     if not isinstance(data, dict):
         return False
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     chunk = data.get("chunk", "")
     if not isinstance(chunk, str) or len(chunk) > MAX_CHUNK_B64_LEN:
         return False
@@ -380,7 +408,7 @@ def handle_relay_file_done(data):
     if not isinstance(data, dict):
         return
     sid = request.sid
-    target_sid = data.get("to")
+    target_sid = resolve_target_sid(data.get("to"))
     if target_sid in peers and _same_room(sid, target_sid):
         emit("relay_file_done", {
             "from": sid,
@@ -690,7 +718,8 @@ var batchStore = {};          // batchId -> { sender, items: [], total, cardEl }
 var mediaRegistry = {};       // mediaId -> { url, name, type, size, blob }
 var lightboxItems = [];
 var lightboxIndex = 0;
-var CHUNK_SIZE = 16384;
+var CHUNK_SIZE = 65536;
+var RELAY_BATCH_CONCURRENCY = 2;
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
@@ -1049,7 +1078,15 @@ function bindSocketEvents() {
         mySid = data.sid;
         myPeerId = data.peer_id;
         document.getElementById("my-id").textContent = myPeerId;
-        log("ID: " + myPeerId, "info");
+        if (data.name) {
+            document.getElementById("my-name").value = data.name;
+        }
+        if (data.room && data.room !== "Lobby") {
+            document.getElementById("room-name").textContent = data.room;
+        } else {
+            document.getElementById("room-name").textContent = "Lobby";
+        }
+        log("ID: " + myPeerId + (data.room && data.room !== "Lobby" ? " (room " + data.room + ")" : ""), "info");
     });
 
     socket.on("peers", function(data) {
@@ -1287,7 +1324,8 @@ function sendTextTo(targetSid, text) {
         pc.dataChannel.send(JSON.stringify({ t: "txt", c: text }));
         log("Sent text (P2P)", "p2p");
     } else {
-        socket.emit("relay_text", { to: targetSid, text: text });
+        var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
+        socket.emit("relay_text", { to: (pInfo ? pInfo.id : targetSid), text: text });
         log("Sent text (Relay)", "info");
     }
 }
@@ -1316,12 +1354,15 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
     batchTotal = batchTotal || 1;
     batchIndex = (typeof batchIndex === "number") ? batchIndex : 0;
     var transferId = generateTransferId();
+    var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
+    var targetPeerId = pInfo ? pInfo.id : targetSid;
     var meta = {
         file: file,
         transfer_id: transferId,
         batch_id: batchId,
         batch_total: batchTotal,
-        batch_index: batchIndex
+        batch_index: batchIndex,
+        target_peer_id: targetPeerId
     };
     var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
     if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
@@ -1329,7 +1370,7 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         pendingFileQueue[targetSid].push(meta);
         if (pendingFileQueue[targetSid].length === 1) {
             socket.emit("broadcast_request", {
-                to: targetSid,
+                to: targetPeerId,
                 file_name: file.name,
                 file_size: file.size,
                 file_type: file.type,
@@ -1342,7 +1383,9 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
     } else {
         if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
         relayFileQueue[targetSid].push(meta);
-        if (relayFileQueue[targetSid].length === 1) {
+        if (relayFileQueue[targetSid]._active === undefined) {
+            processRelayQueue(targetSid);
+        } else if (relayFileQueue[targetSid]._active < RELAY_BATCH_CONCURRENCY) {
             processRelayQueue(targetSid);
         }
     }
@@ -1350,12 +1393,16 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
 
 function processRelayQueue(targetSid) {
     var queue = relayFileQueue[targetSid];
-    if (!queue || !queue.length) return;
-    var item = queue[0];
-    relaySendFile(targetSid, item.file, item.transfer_id, item.batch_id, item.batch_total, item.batch_index, function() {
-        queue.shift();
-        if (queue.length) processRelayQueue(targetSid);
-    });
+    if (!queue) return;
+    if (queue._active === undefined) queue._active = 0;
+    while (queue._active < RELAY_BATCH_CONCURRENCY && queue.length) {
+        var item = queue.shift();
+        queue._active++;
+        relaySendFile(targetSid, item.target_peer_id, item.file, item.transfer_id, item.batch_id, item.batch_total, item.batch_index, function() {
+            queue._active--;
+            processRelayQueue(targetSid);
+        });
+    }
 }
 
 function startDataTransfer(targetSid, transferId) {
@@ -1403,8 +1450,9 @@ function startDataTransfer(targetSid, transferId) {
             queue.shift();
             if (queue.length) {
                 var next = queue[0];
+                var nextPeerId = next.target_peer_id || targetSid;
                 socket.emit("broadcast_request", {
-                    to: targetSid,
+                    to: nextPeerId,
                     file_name: next.file.name,
                     file_size: next.file.size,
                     file_type: next.file.type,
@@ -1420,9 +1468,10 @@ function startDataTransfer(targetSid, transferId) {
     reader.readAsArrayBuffer(file);
 }
 
-function relaySendFile(targetSid, file, transferId, batchId, batchTotal, batchIndex, onComplete) {
+function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batchTotal, batchIndex, onComplete) {
+    targetPeerId = targetPeerId || targetSid;
     socket.emit("relay_file_start", {
-        to: targetSid,
+        to: targetPeerId,
         file_name: file.name,
         file_size: file.size,
         file_type: file.type,
@@ -1441,7 +1490,7 @@ function relaySendFile(targetSid, file, transferId, batchId, batchTotal, batchIn
         var total = bytes.length;
         var offset = 0;
         var inFlight = 0;
-        var MAX_IN_FLIGHT = 4;
+        var MAX_IN_FLIGHT = 10;
         var MAX_RETRIES = 6;
         var aborted = false;
         var sentBytes = 0;
@@ -1451,7 +1500,7 @@ function relaySendFile(targetSid, file, transferId, batchId, batchTotal, batchIn
 
         function finishIfDone() {
             if (!aborted && offset >= total && inFlight === 0) {
-                socket.emit("relay_file_done", { to: targetSid, transfer_id: transferId });
+                socket.emit("relay_file_done", { to: targetPeerId, transfer_id: transferId });
                 log("Sent " + file.name + " (Relay)", "success");
                 setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
                 if (onComplete) onComplete();
@@ -1462,7 +1511,7 @@ function relaySendFile(targetSid, file, transferId, batchId, batchTotal, batchIn
             var attempts = 0;
             function attempt() {
                 if (aborted) return;
-                socket.emit("relay_file_chunk", { to: targetSid, transfer_id: transferId, chunk: b64, seq: seq }, function(ack) {
+                socket.emit("relay_file_chunk", { to: targetPeerId, transfer_id: transferId, chunk: b64, seq: seq }, function(ack) {
                     if (ack) {
                         inFlight--;
                         sentBytes += chunkLen;
