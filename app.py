@@ -29,7 +29,7 @@ socketio = SocketIO(
     async_mode="gevent",
     ping_timeout=60,
     ping_interval=25,
-    max_http_buffer_size=20 * 1024 * 1024,
+    max_http_buffer_size=30 * 1024 * 1024,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,10 +48,11 @@ CLEANUP_INTERVAL = 30
 NAME_RE = re.compile(r"^[\w \-.]{1,32}$", re.UNICODE)
 ROOM_CODE_RE = re.compile(r"^\d{6}$")
 MAX_TEXT_LEN = 20000
-MAX_CHUNK_B64_LEN = 400_000       # bounds per-message relay memory (~300KB raw)
+MAX_CHUNK_B64_LEN = 700_000       # ~500KB raw base64 or binary payload ceiling
+MAX_CHUNK_BIN_LEN = 524_288       # 512KB binary chunk ceiling
 RATE_LIMIT_WINDOW = 5.0
 RATE_LIMIT_MAX_EVENTS = 60
-FILECHUNK_RATE_LIMIT = 900   # higher ceiling for concurrent chunk streams
+FILECHUNK_RATE_LIMIT = 1200  # higher ceiling for concurrent chunk streams
 FILECHUNK_WINDOW = 5.0
 
 
@@ -389,15 +390,28 @@ def handle_relay_file_chunk(data):
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
     chunk = data.get("chunk", "")
-    if not isinstance(chunk, str) or len(chunk) > MAX_CHUNK_B64_LEN:
+    # Accept binary (bytes) or base64 string for backward compatibility
+    if isinstance(chunk, (bytes, bytearray, memoryview)):
+        if len(chunk) > MAX_CHUNK_BIN_LEN:
+            return False
+        chunk_payload = bytes(chunk)
+        is_bin = True
+    elif isinstance(chunk, str):
+        if len(chunk) > MAX_CHUNK_B64_LEN:
+            return False
+        chunk_payload = chunk
+        is_bin = False
+    else:
         return False
     if target_sid in peers and _same_room(sid, target_sid):
-        emit("relay_file_chunk", {
+        payload = {
             "from": sid,
             "transfer_id": str(data.get("transfer_id", ""))[:64],
-            "chunk": chunk,
-            "seq": int(data.get("seq", 0) or 0)
-        }, room=target_sid)
+            "chunk": chunk_payload,
+            "seq": int(data.get("seq", 0) or 0),
+            "bin": is_bin,
+        }
+        emit("relay_file_chunk", payload, room=target_sid)
         return True
     return False
 
@@ -718,25 +732,35 @@ var batchStore = {};          // batchId -> { sender, items: [], total, cardEl }
 var mediaRegistry = {};       // mediaId -> { url, name, type, size, blob }
 var lightboxItems = [];
 var lightboxIndex = 0;
-var CHUNK_SIZE = 65536;
-var RELAY_BATCH_CONCURRENCY = 2;
+var CHUNK_SIZE = 65536;          // P2P DataChannel chunk (64KB, browser-safe)
+var RELAY_CHUNK_SIZE = 131072;   // Relay binary chunk (128KB)
+var RELAY_BATCH_CONCURRENCY = 3;
+var RELAY_MAX_IN_FLIGHT = 16;
+var P2P_BUFFER_HIGH = 8 * 1024 * 1024;  // pause send above 8MB buffered
+var P2P_BUFFER_LOW  = 2 * 1024 * 1024;  // resume when below 2MB
+var P2P_CONNECT_TIMEOUT_MS = 10000;
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" },
         {
             urls: [
                 "turn:openrelay.metered.ca:80",
                 "turn:openrelay.metered.ca:443",
-                "turn:openrelay.metered.ca:443?transport=tcp"
+                "turn:openrelay.metered.ca:443?transport=tcp",
+                "turns:openrelay.metered.ca:443"
             ],
             username: "openrelayproject",
             credential: "openrelayproject"
         }
-    ]
+    ],
+    iceCandidatePoolSize: 4,
+    iceTransportPolicy: "all"
 };
 var WEBRTC_SUPPORTED = (typeof window.RTCPeerConnection === "function");
 var DEVICE_FP = null;
+var p2pFailed = {};  // targetSid -> true when ICE failed / timed out → force relay
 
 function switchTab(tab) {
     var cards = ["devices", "transfer", "logs"];
@@ -1091,6 +1115,16 @@ function bindSocketEvents() {
 
     socket.on("peers", function(data) {
         peerList = data;
+        // Clear p2pFailed for peers that got new sids (reconnect)
+        var liveSids = {};
+        data.forEach(function(p) { liveSids[p.sid] = true; });
+        Object.keys(p2pFailed).forEach(function(sid) {
+            if (!liveSids[sid]) delete p2pFailed[sid];
+        });
+        // Drop stale connection objects for gone sids
+        Object.keys(connections).forEach(function(sid) {
+            if (!liveSids[sid]) destroyConnection(sid, "peer left");
+        });
         renderPeers();
     });
 
@@ -1133,8 +1167,15 @@ function bindSocketEvents() {
     });
 
     socket.on("relay_file_chunk", function(data) {
-        if (relayBuffer[data.transfer_id]) {
-            var binary = atob(data.chunk);
+        if (!relayBuffer[data.transfer_id]) return;
+        var chunk = data.chunk;
+        if (chunk instanceof ArrayBuffer) {
+            relayBuffer[data.transfer_id][data.seq] = chunk;
+        } else if (chunk && chunk.buffer && chunk.byteLength !== undefined) {
+            // Uint8Array / typed array
+            relayBuffer[data.transfer_id][data.seq] = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+        } else if (typeof chunk === "string") {
+            var binary = atob(chunk);
             var bytes = new Uint8Array(binary.length);
             for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             relayBuffer[data.transfer_id][data.seq] = bytes.buffer;
@@ -1233,27 +1274,122 @@ function joinRoom() {
 function createRoom() { socket.emit("create_room_code"); }
 function leaveRoom() { socket.emit("leave_room_code"); }
 
+function resolvePeerId(targetSid) {
+    var p = peerList.find(function(x) { return x.sid === targetSid; });
+    return p ? p.id : targetSid;
+}
+
+function destroyConnection(targetSid, reason) {
+    var pc = connections[targetSid];
+    if (!pc) return;
+    try {
+        if (pc.dataChannel) {
+            try { pc.dataChannel.close(); } catch (e) {}
+        }
+        pc.close();
+    } catch (e) {}
+    delete connections[targetSid];
+    if (reason) log("P2P closed " + targetSid.slice(0, 6) + ": " + reason, "warn");
+}
+
 function getOrCreateConnection(targetSid, isInitiator) {
     if (!WEBRTC_SUPPORTED) return null;
-    if (connections[targetSid]) return connections[targetSid];
+    if (p2pFailed[targetSid]) return null;
+    if (connections[targetSid]) {
+        var existing = connections[targetSid];
+        var st = existing.connectionState || existing.iceConnectionState;
+        if (st === "failed" || st === "closed") {
+            destroyConnection(targetSid, st);
+        } else {
+            return existing;
+        }
+    }
 
+    var targetPeerId = resolvePeerId(targetSid);
     var pc = new RTCPeerConnection(STUN_SERVERS);
     pc.iceQueue = [];
     pc.targetSid = targetSid;
+    pc.targetPeerId = targetPeerId;
     pc.receiveBuffer = {};
+    pc._makingOffer = false;
+    pc._connectTimer = null;
 
     pc.onicecandidate = function(e) {
         if (e.candidate) {
-            socket.emit("signal", { to: targetSid, signal: { type: "ice", candidate: e.candidate } });
+            socket.emit("signal", {
+                to: targetPeerId,
+                signal: { type: "ice", candidate: e.candidate }
+            });
+        }
+    };
+
+    pc.oniceconnectionstatechange = function() {
+        var s = pc.iceConnectionState;
+        if (s === "connected" || s === "completed") {
+            log("ICE " + s + " → " + targetSid.slice(0, 6), "p2p");
+            if (pc._connectTimer) { clearTimeout(pc._connectTimer); pc._connectTimer = null; }
+            delete p2pFailed[targetSid];
+        } else if (s === "failed") {
+            log("ICE failed → " + targetSid.slice(0, 6) + " (will use relay)", "warn");
+            p2pFailed[targetSid] = true;
+            if (pc._connectTimer) { clearTimeout(pc._connectTimer); pc._connectTimer = null; }
+            // Try one ICE restart before giving up
+            if (!pc._restarted) {
+                pc._restarted = true;
+                try {
+                    pc.restartIce();
+                    if (isInitiator || pc._wasInitiator) {
+                        pc.createOffer({ iceRestart: true }).then(function(offer) {
+                            return pc.setLocalDescription(offer);
+                        }).then(function() {
+                            socket.emit("signal", {
+                                to: targetPeerId,
+                                signal: { type: "offer", sdp: pc.localDescription }
+                            });
+                        }).catch(function() {
+                            destroyConnection(targetSid, "ICE restart failed");
+                        });
+                    }
+                } catch (e) {
+                    destroyConnection(targetSid, "ICE failed");
+                }
+            } else {
+                destroyConnection(targetSid, "ICE failed after restart");
+            }
+        } else if (s === "disconnected") {
+            log("ICE disconnected → " + targetSid.slice(0, 6), "warn");
+        }
+    };
+
+    pc.onconnectionstatechange = function() {
+        var s = pc.connectionState;
+        if (s === "failed" || s === "closed") {
+            p2pFailed[targetSid] = true;
+            destroyConnection(targetSid, "connection " + s);
         }
     };
 
     pc.ondatachannel = function(e) { setupDataChannel(pc, e.channel, targetSid); };
 
     if (isInitiator) {
-        var channel = pc.createDataChannel("pairme", { ordered: true });
+        pc._wasInitiator = true;
+        var channel = pc.createDataChannel("pairme", {
+            ordered: true,
+            maxRetransmits: 30
+        });
         setupDataChannel(pc, channel, targetSid);
     }
+
+    // Timeout: if not connected in time, force relay path
+    pc._connectTimer = setTimeout(function() {
+        if (!pc.dataChannel || pc.dataChannel.readyState !== "open") {
+            var st = pc.iceConnectionState;
+            if (st !== "connected" && st !== "completed") {
+                log("P2P timeout (" + (P2P_CONNECT_TIMEOUT_MS / 1000) + "s) → relay for " + targetSid.slice(0, 6), "warn");
+                p2pFailed[targetSid] = true;
+            }
+        }
+    }, P2P_CONNECT_TIMEOUT_MS);
 
     connections[targetSid] = pc;
     return pc;
@@ -1261,48 +1397,109 @@ function getOrCreateConnection(targetSid, isInitiator) {
 
 function setupDataChannel(pc, channel, targetSid) {
     pc.dataChannel = channel;
-    channel.onopen = function() { log("P2P open with " + targetSid.slice(0, 4), "p2p"); };
+    channel.binaryType = "arraybuffer";
+    channel.bufferedAmountLowThreshold = P2P_BUFFER_LOW;
+
+    channel.onopen = function() {
+        log("P2P open with " + targetSid.slice(0, 6), "p2p");
+        delete p2pFailed[targetSid];
+        if (pc._connectTimer) { clearTimeout(pc._connectTimer); pc._connectTimer = null; }
+    };
     channel.onmessage = function(e) { handleDataMessage(e.data, targetSid); };
-    channel.onerror = function(err) { log("Channel error: " + err.message, "error"); };
+    channel.onerror = function(err) {
+        log("Channel error: " + (err && err.message ? err.message : err), "error");
+    };
+    channel.onclose = function() {
+        log("P2P channel closed " + targetSid.slice(0, 6), "warn");
+    };
 }
 
 function handleSignal(data) {
     var fromSid = data.from;
     var signal = data.signal;
+    if (!signal) return;
+
+    // Prefer mapping from peer_id if from_peer provided
+    if (data.from_peer) {
+        var matched = peerList.find(function(p) { return p.id === data.from_peer; });
+        if (matched) fromSid = matched.sid;
+    }
+
     var pc = getOrCreateConnection(fromSid, false);
+    if (!pc) return;
+
+    var targetPeerId = pc.targetPeerId || resolvePeerId(fromSid);
 
     if (signal.type === "offer") {
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
             .then(function() {
-                while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
+                while (pc.iceQueue.length) {
+                    try { pc.addIceCandidate(pc.iceQueue.shift()); } catch (e) {}
+                }
                 return pc.createAnswer();
             })
             .then(function(ans) { return pc.setLocalDescription(ans); })
-            .then(function() { socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } }); })
+            .then(function() {
+                socket.emit("signal", {
+                    to: targetPeerId,
+                    signal: { type: "answer", sdp: pc.localDescription }
+                });
+            })
             .catch(function(err) { log("Offer err: " + err.message, "error"); });
     } else if (signal.type === "answer") {
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
             .then(function() {
-                while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
+                while (pc.iceQueue.length) {
+                    try { pc.addIceCandidate(pc.iceQueue.shift()); } catch (e) {}
+                }
             })
             .catch(function(err) { log("Answer err: " + err.message, "error"); });
     } else if (signal.type === "ice") {
         var candidate = new RTCIceCandidate(signal.candidate);
-        if (pc.remoteDescription && pc.remoteDescription.type) pc.addIceCandidate(candidate);
-        else pc.iceQueue.push(candidate);
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+            pc.addIceCandidate(candidate).catch(function() {});
+        } else {
+            pc.iceQueue.push(candidate);
+        }
     }
 }
 
 function connectPeer(targetSid) {
     if (!WEBRTC_SUPPORTED) {
-        log("WebRTC not supported on this browser, using relay only", "warn");
+        log("WebRTC not supported, using relay only", "warn");
+        return;
+    }
+    if (p2pFailed[targetSid]) {
+        log("P2P previously failed for " + targetSid.slice(0, 6) + ", using relay", "info");
+        return;
+    }
+    var existing = connections[targetSid];
+    if (existing && existing.dataChannel && existing.dataChannel.readyState === "open") {
         return;
     }
     var pc = getOrCreateConnection(targetSid, true);
+    if (!pc) return;
+    var targetPeerId = pc.targetPeerId || resolvePeerId(targetSid);
+    pc._makingOffer = true;
     pc.createOffer()
         .then(function(offer) { return pc.setLocalDescription(offer); })
-        .then(function() { socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } }); })
-        .catch(function(err) { log("Offer err: " + err.message, "error"); });
+        .then(function() {
+            socket.emit("signal", {
+                to: targetPeerId,
+                signal: { type: "offer", sdp: pc.localDescription }
+            });
+        })
+        .catch(function(err) {
+            log("Offer err: " + err.message, "error");
+            p2pFailed[targetSid] = true;
+        })
+        .finally(function() { pc._makingOffer = false; });
+}
+
+function isP2PReady(targetSid) {
+    if (p2pFailed[targetSid]) return false;
+    var pc = connections[targetSid];
+    return !!(pc && pc.dataChannel && pc.dataChannel.readyState === "open");
 }
 
 function sendText() {
@@ -1319,13 +1516,11 @@ function sendText() {
 }
 
 function sendTextTo(targetSid, text) {
-    var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
-    if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
-        pc.dataChannel.send(JSON.stringify({ t: "txt", c: text }));
+    if (isP2PReady(targetSid)) {
+        connections[targetSid].dataChannel.send(JSON.stringify({ t: "txt", c: text }));
         log("Sent text (P2P)", "p2p");
     } else {
-        var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
-        socket.emit("relay_text", { to: (pInfo ? pInfo.id : targetSid), text: text });
+        socket.emit("relay_text", { to: resolvePeerId(targetSid), text: text });
         log("Sent text (Relay)", "info");
     }
 }
@@ -1354,8 +1549,7 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
     batchTotal = batchTotal || 1;
     batchIndex = (typeof batchIndex === "number") ? batchIndex : 0;
     var transferId = generateTransferId();
-    var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
-    var targetPeerId = pInfo ? pInfo.id : targetSid;
+    var targetPeerId = resolvePeerId(targetSid);
     var meta = {
         file: file,
         transfer_id: transferId,
@@ -1364,8 +1558,13 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         batch_index: batchIndex,
         target_peer_id: targetPeerId
     };
-    var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
-    if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
+
+    // Try establish P2P if not ready and not previously failed
+    if (WEBRTC_SUPPORTED && !isP2PReady(targetSid) && !p2pFailed[targetSid]) {
+        connectPeer(targetSid);
+    }
+
+    if (isP2PReady(targetSid)) {
         if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
         pendingFileQueue[targetSid].push(meta);
         if (pendingFileQueue[targetSid].length === 1) {
@@ -1381,13 +1580,10 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
             });
         }
     } else {
+        // Relay path (immediate or after P2P timeout user can re-send; for now always queue relay)
         if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
         relayFileQueue[targetSid].push(meta);
-        if (relayFileQueue[targetSid]._active === undefined) {
-            processRelayQueue(targetSid);
-        } else if (relayFileQueue[targetSid]._active < RELAY_BATCH_CONCURRENCY) {
-            processRelayQueue(targetSid);
-        }
+        processRelayQueue(targetSid);
     }
 }
 
@@ -1411,6 +1607,17 @@ function startDataTransfer(targetSid, transferId) {
     var item = queue[0];
     var file = item.file;
     var pc = connections[targetSid];
+    if (!pc || !pc.dataChannel || pc.dataChannel.readyState !== "open") {
+        // Channel died — fall back remaining queue to relay
+        log("P2P channel gone, falling back to relay", "warn");
+        while (queue.length) {
+            var q = queue.shift();
+            if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
+            relayFileQueue[targetSid].push(q);
+        }
+        processRelayQueue(targetSid);
+        return;
+    }
     var channel = pc.dataChannel;
 
     channel.send(JSON.stringify({
@@ -1424,48 +1631,122 @@ function startDataTransfer(targetSid, transferId) {
         bi: item.batch_index
     }));
 
-    var reader = new FileReader();
-    reader.onload = function(e) {
-        var buffer = e.target.result;
-        var offset = 0;
-        document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "Sending " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "");
+    document.getElementById("progress-wrap").style.display = "block";
+    document.getElementById("send-status").textContent = "Sending " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "") + " [P2P]";
 
-        function sendChunk() {
-            while (offset < buffer.byteLength) {
-                if (channel.bufferedAmount > CHUNK_SIZE * 8) {
-                    setTimeout(sendChunk, 20);
-                    return;
+    // Stream via file.slice to avoid loading entire file into RAM for huge files
+    var offset = 0;
+    var total = file.size;
+    var waitingDrain = false;
+
+    function finishP2P() {
+        channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
+        log("Sent " + file.name + " (P2P)", "success");
+        setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
+        queue.shift();
+        if (queue.length) {
+            var next = queue[0];
+            socket.emit("broadcast_request", {
+                to: next.target_peer_id || resolvePeerId(targetSid),
+                file_name: next.file.name,
+                file_size: next.file.size,
+                file_type: next.file.type,
+                transfer_id: next.transfer_id,
+                batch_id: next.batch_id,
+                batch_total: next.batch_total,
+                batch_index: next.batch_index
+            });
+        }
+    }
+
+    function pumpP2P() {
+        if (channel.readyState !== "open") {
+            log("Channel closed mid-transfer, fallback relay", "warn");
+            p2pFailed[targetSid] = true;
+            while (queue.length) {
+                var q = queue.shift();
+                if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
+                relayFileQueue[targetSid].push(q);
+            }
+            processRelayQueue(targetSid);
+            return;
+        }
+        while (offset < total) {
+            if (channel.bufferedAmount >= P2P_BUFFER_HIGH) {
+                if (!waitingDrain) {
+                    waitingDrain = true;
+                    channel.onbufferedamountlow = function() {
+                        waitingDrain = false;
+                        channel.onbufferedamountlow = null;
+                        pumpP2P();
+                    };
                 }
-                var chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-                channel.send(chunk);
-                offset += CHUNK_SIZE;
-                var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
+                return;
+            }
+            var end = Math.min(offset + CHUNK_SIZE, total);
+            var blob = file.slice(offset, end);
+            // Sync-ish read via FileReader for this small slice
+            // Use arrayBuffer() when available (modern browsers)
+            if (blob.arrayBuffer) {
+                // Pause loop; continue after promise
+                var curOffset = offset;
+                offset = end; // advance optimistically
+                blob.arrayBuffer().then(function(buf) {
+                    if (channel.readyState === "open") {
+                        channel.send(buf);
+                        var pct = Math.min(100, Math.round((Math.max(0, curOffset + buf.byteLength - channel.bufferedAmount) / total) * 100));
+                        // simpler progress by offset
+                        pct = Math.min(100, Math.round((end / total) * 100));
+                        document.getElementById("progress-fill").style.width = pct + "%";
+                        document.getElementById("send-pct").textContent = pct + "%";
+                    }
+                    if (offset >= total && channel.bufferedAmount === 0) {
+                        finishP2P();
+                    } else {
+                        pumpP2P();
+                    }
+                }).catch(function(err) {
+                    log("P2P read error: " + err.message, "error");
+                });
+                return;
+            }
+            // Fallback FileReader path
+            break;
+        }
+        if (offset >= total) {
+            // Wait for buffer drain before done signal
+            if (channel.bufferedAmount > 0) {
+                channel.onbufferedamountlow = function() {
+                    channel.onbufferedamountlow = null;
+                    if (channel.bufferedAmount === 0) finishP2P();
+                    else pumpP2P();
+                };
+                // Also poll in case event misses
+                setTimeout(function check() {
+                    if (channel.bufferedAmount === 0) finishP2P();
+                    else setTimeout(check, 50);
+                }, 50);
+            } else {
+                finishP2P();
+            }
+            return;
+        }
+        // FileReader fallback for older browsers
+        var end2 = Math.min(offset + CHUNK_SIZE, total);
+        var reader = new FileReader();
+        reader.onload = function(e) {
+            if (channel.readyState === "open") {
+                channel.send(e.target.result);
+                offset = end2;
+                var pct = Math.min(100, Math.round((offset / total) * 100));
                 document.getElementById("progress-fill").style.width = pct + "%";
                 document.getElementById("send-pct").textContent = pct + "%";
-            }
-            channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
-            log("Sent " + file.name + " (P2P)", "success");
-            setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
-            queue.shift();
-            if (queue.length) {
-                var next = queue[0];
-                var nextPeerId = next.target_peer_id || targetSid;
-                socket.emit("broadcast_request", {
-                    to: nextPeerId,
-                    file_name: next.file.name,
-                    file_size: next.file.size,
-                    file_type: next.file.type,
-                    transfer_id: next.transfer_id,
-                    batch_id: next.batch_id,
-                    batch_total: next.batch_total,
-                    batch_index: next.batch_index
-                });
+                pumpP2P();
             }
         };
-        sendChunk();
-    };
-    reader.readAsArrayBuffer(file);
+        reader.readAsArrayBuffer(file.slice(offset, end2));
+    }
+    pumpP2P();
 }
 
 function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batchTotal, batchIndex, onComplete) {
@@ -1480,77 +1761,104 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
         batch_total: batchTotal || 1,
         batch_index: batchIndex || 0
     });
-    var reader = new FileReader();
-    reader.onerror = function() {
-        log("Failed to read " + file.name, "error");
-        if (onComplete) onComplete();
-    };
-    reader.onload = function(e) {
-        var bytes = new Uint8Array(e.target.result);
-        var total = bytes.length;
-        var offset = 0;
-        var inFlight = 0;
-        var MAX_IN_FLIGHT = 10;
-        var MAX_RETRIES = 6;
-        var aborted = false;
-        var sentBytes = 0;
-        var seqCounter = 0;
-        document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "Sending " + file.name;
 
-        function finishIfDone() {
-            if (!aborted && offset >= total && inFlight === 0) {
-                socket.emit("relay_file_done", { to: targetPeerId, transfer_id: transferId });
-                log("Sent " + file.name + " (Relay)", "success");
-                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
-                if (onComplete) onComplete();
-            }
+    var total = file.size;
+    var offset = 0;
+    var inFlight = 0;
+    var MAX_IN_FLIGHT = RELAY_MAX_IN_FLIGHT;
+    var MAX_RETRIES = 8;
+    var aborted = false;
+    var sentBytes = 0;
+    var seqCounter = 0;
+    var useBinary = true; // Socket.IO binary support
+
+    document.getElementById("progress-wrap").style.display = "block";
+    document.getElementById("send-status").textContent = "Sending " + file.name + (batchTotal > 1 ? " (" + (batchIndex + 1) + "/" + batchTotal + ")" : "") + " [Relay]";
+
+    function finishIfDone() {
+        if (!aborted && offset >= total && inFlight === 0) {
+            socket.emit("relay_file_done", { to: targetPeerId, transfer_id: transferId });
+            log("Sent " + file.name + " (Relay)", "success");
+            setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
+            if (onComplete) onComplete();
         }
+    }
 
-        function sendOneChunk(seq, b64, chunkLen) {
-            var attempts = 0;
-            function attempt() {
-                if (aborted) return;
-                socket.emit("relay_file_chunk", { to: targetPeerId, transfer_id: transferId, chunk: b64, seq: seq }, function(ack) {
-                    if (ack) {
-                        inFlight--;
-                        sentBytes += chunkLen;
-                        var pct = Math.min(100, Math.round((sentBytes / total) * 100));
-                        document.getElementById("progress-fill").style.width = pct + "%";
-                        document.getElementById("send-pct").textContent = pct + "%";
-                        pump();
-                        finishIfDone();
-                    } else if (attempts < MAX_RETRIES) {
-                        attempts++;
-                        setTimeout(attempt, 150 * attempts);
-                    } else {
-                        inFlight--;
-                        aborted = true;
-                        log("Giving up on " + file.name + " after repeated failures", "error");
-                        document.getElementById("progress-wrap").style.display = "none";
-                        if (onComplete) onComplete();
-                    }
+    function sendOneChunk(seq, payload, chunkLen) {
+        var attempts = 0;
+        function attempt() {
+            if (aborted) return;
+            socket.emit("relay_file_chunk", {
+                to: targetPeerId,
+                transfer_id: transferId,
+                chunk: payload,
+                seq: seq
+            }, function(ack) {
+                if (ack) {
+                    inFlight--;
+                    sentBytes += chunkLen;
+                    var pct = Math.min(100, Math.round((sentBytes / total) * 100));
+                    document.getElementById("progress-fill").style.width = pct + "%";
+                    document.getElementById("send-pct").textContent = pct + "%";
+                    pump();
+                    finishIfDone();
+                } else if (attempts < MAX_RETRIES) {
+                    attempts++;
+                    setTimeout(attempt, 120 * attempts);
+                } else {
+                    inFlight--;
+                    aborted = true;
+                    log("Giving up on " + file.name + " after repeated failures", "error");
+                    document.getElementById("progress-wrap").style.display = "none";
+                    if (onComplete) onComplete();
+                }
+            });
+        }
+        attempt();
+    }
+
+    function pump() {
+        while (!aborted && inFlight < MAX_IN_FLIGHT && offset < total) {
+            var end = Math.min(offset + RELAY_CHUNK_SIZE, total);
+            var slice = file.slice(offset, end);
+            var chunkLen = end - offset;
+            var seq = seqCounter++;
+            offset = end;
+            inFlight++;
+
+            if (useBinary && slice.arrayBuffer) {
+                slice.arrayBuffer().then(function(buf) {
+                    sendOneChunk(seq, buf, chunkLen);
+                }).catch(function() {
+                    // fallback base64
+                    var reader = new FileReader();
+                    reader.onload = function(ev) {
+                        var bytes = new Uint8Array(ev.target.result);
+                        var binary = "";
+                        for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                        sendOneChunk(seq, btoa(binary), chunkLen);
+                    };
+                    reader.readAsArrayBuffer(slice);
                 });
+            } else {
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    var bytes = new Uint8Array(ev.target.result);
+                    var binary = "";
+                    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                    sendOneChunk(seq, btoa(binary), chunkLen);
+                };
+                reader.onerror = function() {
+                    inFlight--;
+                    aborted = true;
+                    log("Failed to read " + file.name, "error");
+                    if (onComplete) onComplete();
+                };
+                reader.readAsArrayBuffer(slice);
             }
-            attempt();
         }
-
-        function pump() {
-            while (!aborted && inFlight < MAX_IN_FLIGHT && offset < total) {
-                var end = Math.min(offset + CHUNK_SIZE, total);
-                var chunk = bytes.subarray(offset, end);
-                var binary = "";
-                for (var i = 0; i < chunk.length; i++) binary += String.fromCharCode(chunk[i]);
-                var b64 = btoa(binary);
-                var chunkLen = end - offset;
-                offset = end;
-                inFlight++;
-                sendOneChunk(seqCounter++, b64, chunkLen);
-            }
-        }
-        pump();
-    };
-    reader.readAsArrayBuffer(file);
+    }
+    pump();
 }
 
 function handleDataMessage(data, fromSid) {
