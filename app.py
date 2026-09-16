@@ -50,8 +50,8 @@ ROOM_CODE_RE = re.compile(r"^\d{6}$")
 MAX_TEXT_LEN = 20000
 MAX_CHUNK_B64_LEN = 400_000
 RATE_LIMIT_WINDOW = 5.0
-RATE_LIMIT_MAX_EVENTS = 60
-FILECHUNK_RATE_LIMIT = 900
+RATE_LIMIT_MAX_EVENTS = 80
+FILECHUNK_RATE_LIMIT = 1200
 FILECHUNK_WINDOW = 5.0
 
 
@@ -406,6 +406,7 @@ def handle_relay_file_done(data):
             "transfer_id": str(data.get("transfer_id", ""))[:64]
         }, room=target_sid)
 
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -413,7 +414,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>PairMe - Fast Cross-Device File & Text Sharing</title>
     <meta name="description" content="Seamless peer-to-peer file transfer and real-time text sharing between all your devices over local network and internet.">
-    <meta name="theme-color" content="#ffffff">
+    <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
     <meta property="og:type" content="website">
     <meta property="og:title" content="PairMe - Fast Cross-Device Sharing">
     <meta property="og:description" content="Share text, links, code, and files instantly across mobile and desktop devices.">
@@ -424,110 +426,159 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
     <style>
+        :root {
+            --bg: #f8fafc;
+            --card: #ffffff;
+            --border: #e2e8f0;
+            --text: #0f172a;
+            --muted: #64748b;
+            --muted2: #94a3b8;
+            --accent: #0f172a;
+            --accent-soft: #f1f5f9;
+            --success: #15803d;
+            --warn: #b45309;
+            --error: #b91c1c;
+            --p2p: #6b21a8;
+            --shadow: 0 1px 2px rgba(0,0,0,0.04);
+            --radius: 10px;
+        }
+        [data-theme="dark"] {
+            --bg: #0b1220;
+            --card: #111827;
+            --border: #1f2937;
+            --text: #f1f5f9;
+            --muted: #94a3b8;
+            --muted2: #64748b;
+            --accent: #e2e8f0;
+            --accent-soft: #1e293b;
+            --success: #4ade80;
+            --warn: #fbbf24;
+            --error: #f87171;
+            --p2p: #c084fc;
+            --shadow: 0 1px 3px rgba(0,0,0,0.35);
+        }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
-        body { background: #f8fafc; color: #0f172a; height: 100vh; display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; }
-        header { background: #ffffff; padding: 10px 16px; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
-        .brand { font-size: 16px; font-weight: 700; color: #0f172a; letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
-        .brand img { width: 22px; height: 22px; border-radius: 4px; object-fit: cover; }
-        .room-tag { background: #f1f5f9; color: #475569; padding: 4px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid #e2e8f0; display: flex; align-items: center; gap: 4px; }
-        .mobile-nav { display: none; background: #ffffff; border-bottom: 1px solid #e2e8f0; flex-shrink: 0; }
-        .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 10px 0; color: #64748b; font-size: 13px; font-weight: 600; border-radius: 0; }
-        .mobile-nav button.active { color: #0f172a; border-bottom-color: #0f172a; background: transparent; }
+        html, body { height: 100%; }
+        body { background: var(--bg); color: var(--text); display: flex; flex-direction: column; overflow: hidden; -webkit-text-size-adjust: 100%; transition: background 0.2s, color 0.2s; }
+        header { background: var(--card); padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; padding-top: max(10px, env(safe-area-inset-top)); }
+        .brand { font-size: 16px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
+        .brand img { width: 22px; height: 22px; border-radius: 5px; object-fit: cover; }
+        .room-tag { background: var(--accent-soft); color: var(--muted); padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); display: flex; align-items: center; gap: 5px; }
+        .theme-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .mobile-nav { display: none; background: var(--card); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+        .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 12px 0; color: var(--muted); font-size: 13px; font-weight: 600; border-radius: 0; min-height: 44px; }
+        .mobile-nav button.active { color: var(--text); border-bottom-color: var(--text); background: transparent; }
         .app-grid { display: grid; grid-template-columns: 280px 1fr 300px; gap: 12px; padding: 12px; height: calc(100vh - 53px); flex: 1; overflow: hidden; }
-        .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; height: 100%; }
-        .card-header { padding: 10px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #64748b; border-bottom: 1px solid #f1f5f9; display: flex; justify-content: space-between; align-items: center; background: #ffffff; flex-shrink: 0; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); display: flex; flex-direction: column; overflow: hidden; height: 100%; box-shadow: var(--shadow); }
+        .card-header { padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--card); flex-shrink: 0; }
         .card-body { padding: 12px; flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; display: flex; flex-direction: column; gap: 10px; }
-        input, select, textarea { font-size: 13px; border-radius: 6px; border: 1px solid #cbd5e1; background: #ffffff; color: #0f172a; padding: 8px 10px; outline: none; -webkit-appearance: none; appearance: none; }
-        input:focus, select:focus, textarea:focus { border-color: #0f172a; }
-        button { background: #0f172a; color: #ffffff; border: 1px solid #0f172a; border-radius: 6px; font-size: 13px; font-weight: 500; padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-appearance: none; }
+        input, select, textarea { font-size: 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); padding: 10px 12px; outline: none; -webkit-appearance: none; appearance: none; transition: border-color 0.15s; }
+        input:focus, select:focus, textarea:focus { border-color: var(--text); }
+        button { background: var(--accent); color: var(--bg); border: 1px solid var(--accent); border-radius: 8px; font-size: 13px; font-weight: 500; padding: 9px 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-appearance: none; min-height: 38px; transition: opacity 0.15s; }
         button:active { opacity: 0.8; }
-        button.flat { background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; }
-        button.icon-only { padding: 8px; width: 34px; height: 34px; flex-shrink: 0; }
+        button.flat { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+        button.icon-only { padding: 8px; width: 38px; height: 38px; flex-shrink: 0; }
         .row { display: flex; gap: 8px; align-items: center; }
         .flex-1 { flex: 1; min-width: 0; }
-        .peer-item { background: #ffffff; border: 1px solid #e2e8f0; padding: 8px 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; }
-        .peer-item:active, .peer-item.active { border-color: #0f172a; background: #f8fafc; }
-        .peer-info { display: flex; flex-direction: column; }
-        .peer-name { font-weight: 600; font-size: 13px; color: #0f172a; }
-        .peer-id { font-size: 11px; color: #94a3b8; font-family: monospace; }
-        .drop-zone { border: 2px dashed #cbd5e1; border-radius: 8px; padding: 16px; text-align: center; color: #64748b; cursor: pointer; background: #f8fafc; display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 12px; }
+        .peer-item { background: var(--card); border: 1px solid var(--border); padding: 10px 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: border-color 0.15s, background 0.15s; min-height: 48px; }
+        .peer-item:active, .peer-item.active { border-color: var(--text); background: var(--accent-soft); }
+        .peer-info { display: flex; flex-direction: column; gap: 2px; }
+        .peer-name { font-weight: 600; font-size: 13px; color: var(--text); }
+        .peer-id { font-size: 11px; color: var(--muted2); font-family: ui-monospace, monospace; }
+        .peer-status { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; }
+        .status-p2p { background: #f3e8ff; color: #6b21a8; }
+        [data-theme="dark"] .status-p2p { background: #3b0764; color: #e9d5ff; }
+        .status-relay { background: #e0f2fe; color: #0369a1; }
+        [data-theme="dark"] .status-relay { background: #0c4a6e; color: #bae6fd; }
+        .status-conn { background: #fef3c7; color: #b45309; }
+        [data-theme="dark"] .status-conn { background: #78350f; color: #fde68a; }
+        .drop-zone { border: 2px dashed var(--border); border-radius: 10px; padding: 20px 16px; text-align: center; color: var(--muted); cursor: pointer; background: var(--accent-soft); display: flex; flex-direction: column; align-items: center; gap: 8px; font-size: 13px; transition: border-color 0.15s, background 0.15s; min-height: 100px; }
+        .drop-zone.dragover { border-color: var(--text); background: var(--card); }
         .feed-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
-        .feed-item { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; font-size: 13px; box-shadow: 0 1px 2px rgba(0,0,0,0.03); display: flex; flex-direction: column; gap: 8px; }
-        .feed-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
-        .feed-author { font-weight: 600; font-size: 12px; color: #334155; display: flex; align-items: center; gap: 6px; }
-        .feed-time { font-size: 11px; color: #94a3b8; }
+        .feed-item { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; font-size: 13px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px; }
+        .feed-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+        .feed-author { font-weight: 600; font-size: 12px; color: var(--text); display: flex; align-items: center; gap: 6px; }
+        .feed-time { font-size: 11px; color: var(--muted2); }
         .feed-actions { display: flex; gap: 6px; align-items: center; }
-        .text-content { font-size: 13px; line-height: 1.5; color: #1e293b; word-break: break-word; white-space: pre-wrap; }
+        .text-content { font-size: 13px; line-height: 1.55; color: var(--text); word-break: break-word; white-space: pre-wrap; }
         .text-link { color: #2563eb; text-decoration: underline; word-break: break-all; }
-        .code-wrapper { margin: 6px 0; border-radius: 6px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
-        .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 4px 10px; font-size: 11px; color: #94a3b8; font-family: monospace; }
-        .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer; }
+        [data-theme="dark"] .text-link { color: #60a5fa; }
+        .code-wrapper { margin: 6px 0; border-radius: 8px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
+        .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 5px 10px; font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace; }
+        .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 5px; padding: 3px 8px; font-size: 10px; cursor: pointer; }
         .copy-btn:active { background: #334155; }
-        .code-block { color: #f8fafc; padding: 10px; font-family: Consolas, Monaco, "Andale Mono", "Ubuntu Mono", monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; word-wrap: normal; -webkit-overflow-scrolling: touch; }
-        .inline-code { background: #f1f5f9; color: #0f172a; border: 1px solid #e2e8f0; padding: 1px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; word-break: break-all; }
+        .code-block { color: #f8fafc; padding: 10px; font-family: ui-monospace, Consolas, Monaco, monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
+        .inline-code { background: var(--accent-soft); color: var(--text); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
         .expandable-block { position: relative; max-height: 220px; overflow: hidden; transition: max-height 0.2s ease; }
         .expandable-block.expanded { max-height: none !important; }
-        .expandable-overlay { position: absolute; bottom: 0; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,1)); pointer-events: none; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 4px; }
+        .expandable-overlay { position: absolute; bottom: 0; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, transparent, var(--card)); pointer-events: none; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 4px; }
         .expandable-block.expanded .expandable-overlay { display: none; }
-        .expand-toggle-btn { background: #ffffff; border: 1px solid #cbd5e1; color: #0f172a; font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 12px; cursor: pointer; pointer-events: auto; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .file-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: #f8fafc; border: 1px solid #e2e8f0; padding: 8px 10px; border-radius: 6px; }
+        .expand-toggle-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); font-size: 11px; font-weight: 600; padding: 4px 12px; border-radius: 14px; cursor: pointer; pointer-events: auto; box-shadow: var(--shadow); }
+        .file-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--accent-soft); border: 1px solid var(--border); padding: 10px; border-radius: 8px; }
         .file-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-        .file-title { font-weight: 600; font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .file-size { font-size: 11px; color: #64748b; }
-        .file-preview { margin-top: 4px; text-align: center; background: #0f172a; border-radius: 6px; overflow: hidden; max-height: 240px; display: flex; align-items: center; justify-content: center; }
+        .file-title { font-weight: 600; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-size { font-size: 11px; color: var(--muted); }
+        .file-preview { margin-top: 4px; text-align: center; background: #0f172a; border-radius: 8px; overflow: hidden; max-height: 240px; display: flex; align-items: center; justify-content: center; }
         .preview-img { max-width: 100%; max-height: 240px; object-fit: contain; display: block; }
-        .action-btn { background: #ffffff; border: 1px solid #cbd5e1; color: #334155; padding: 4px 8px; font-size: 11px; border-radius: 4px; font-weight: 500; height: 26px; }
-        .action-btn:active { background: #f1f5f9; }
-        .action-btn.primary { background: #0f172a; color: #fff; border-color: #0f172a; }
-        .action-btn.primary:active { opacity: 0.85; }
+        .action-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; font-size: 11px; border-radius: 6px; font-weight: 500; height: 28px; min-height: 28px; }
+        .action-btn:active { background: var(--accent-soft); }
+        .action-btn.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
         .media-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin-top: 4px; }
-        .media-thumb { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #0f172a; cursor: pointer; border: 1px solid #e2e8f0; }
+        .media-thumb { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: #0f172a; cursor: pointer; border: 1px solid var(--border); }
         .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
         .media-thumb .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.35); pointer-events: none; }
         .media-thumb .play-badge svg { width: 22px; height: 22px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
         .batch-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
-        .batch-file-row { display: flex; align-items: center; gap: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; }
-        .batch-file-thumb { width: 40px; height: 40px; border-radius: 5px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .batch-file-row { display: flex; align-items: center; gap: 10px; background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
+        .batch-file-thumb { width: 42px; height: 42px; border-radius: 6px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
         .batch-file-thumb img, .batch-file-thumb video { width: 100%; height: 100%; object-fit: cover; }
-        .batch-file-icon { width: 40px; height: 40px; border-radius: 5px; background: #e2e8f0; color: #475569; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
+        .batch-file-icon { width: 42px; height: 42px; border-radius: 6px; background: var(--border); color: var(--muted); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
         .batch-file-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-        .batch-file-name { font-weight: 600; font-size: 12px; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .batch-file-size { font-size: 11px; color: #64748b; }
+        .batch-file-name { font-weight: 600; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .batch-file-size { font-size: 11px; color: var(--muted); }
         .audio-player-wrap { margin-top: 6px; width: 100%; }
         .audio-player-wrap audio { width: 100%; height: 36px; border-radius: 6px; }
         .batch-audio-row audio { width: 100%; max-width: 220px; height: 32px; }
         .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; }
-        .gallery-meta { font-size: 11px; color: #64748b; margin-top: 2px; }
-        .lightbox { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(15,23,42,0.92); flex-direction: column; align-items: center; justify-content: center; padding: 12px; }
+        .gallery-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+        .lightbox { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(15,23,42,0.94); flex-direction: column; align-items: center; justify-content: center; padding: 12px; padding-top: max(12px, env(safe-area-inset-top)); }
         .lightbox.open { display: flex; }
-        .lightbox-toolbar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; color: #e2e8f0; font-size: 13px; background: linear-gradient(to bottom, rgba(0,0,0,0.5), transparent); }
-        .lightbox-close, .lightbox-nav { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
-        .lightbox-close:active, .lightbox-nav:active { background: rgba(255,255,255,0.25); }
+        .lightbox-toolbar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; color: #e2e8f0; font-size: 13px; background: linear-gradient(to bottom, rgba(0,0,0,0.55), transparent); padding-top: max(12px, env(safe-area-inset-top)); }
+        .lightbox-close, .lightbox-nav { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; min-height: 40px; }
         .lightbox-stage { max-width: 96vw; max-height: 78vh; display: flex; align-items: center; justify-content: center; }
-        .lightbox-stage img, .lightbox-stage video { max-width: 96vw; max-height: 78vh; object-fit: contain; border-radius: 4px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+        .lightbox-stage img, .lightbox-stage video { max-width: 96vw; max-height: 78vh; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
         .lightbox-nav-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; pointer-events: none; padding: 0 8px; }
-        .lightbox-nav-wrap button { pointer-events: auto; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; padding: 0; }
+        .lightbox-nav-wrap button { pointer-events: auto; width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center; padding: 0; }
         .lightbox-counter { font-variant-numeric: tabular-nums; }
-        #log-container { font-family: monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
-        .log-entry { padding: 4px 6px; border-radius: 4px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.3; }
-        .log-time { color: #94a3b8; flex-shrink: 0; }
-        .log-tag { padding: 1px 4px; border-radius: 3px; font-weight: 700; font-size: 9px; text-transform: uppercase; flex-shrink: 0; }
+        #log-container { font-family: ui-monospace, monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
+        .log-entry { padding: 5px 7px; border-radius: 5px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.35; }
+        .log-time { color: var(--muted2); flex-shrink: 0; }
+        .log-tag { padding: 1px 5px; border-radius: 3px; font-weight: 700; font-size: 9px; text-transform: uppercase; flex-shrink: 0; }
         .tag-info { background: #e0f2fe; color: #0369a1; }
         .tag-success { background: #dcfce7; color: #15803d; }
         .tag-warn { background: #fef3c7; color: #b45309; }
         .tag-error { background: #fee2e2; color: #b91c1c; }
         .tag-p2p { background: #f3e8ff; color: #6b21a8; }
-        .progress-bar { height: 4px; background: #e2e8f0; border-radius: 2px; overflow: hidden; margin-top: 4px; }
-        .progress-fill { height: 100%; background: #0f172a; width: 0%; }
-        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.4); z-index: 100; justify-content: center; align-items: center; padding: 16px; }
-        .modal { background: #ffffff; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; width: 100%; max-width: 300px; text-align: center; }
-        .transfer-active-badge { display: none; background: #fef3c7; color: #b45309; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+        [data-theme="dark"] .tag-info { background: #0c4a6e; color: #7dd3fc; }
+        [data-theme="dark"] .tag-success { background: #14532d; color: #86efac; }
+        [data-theme="dark"] .tag-warn { background: #78350f; color: #fcd34d; }
+        [data-theme="dark"] .tag-error { background: #7f1d1d; color: #fca5a5; }
+        [data-theme="dark"] .tag-p2p { background: #3b0764; color: #e9d5ff; }
+        .progress-bar { height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+        .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.12s linear; }
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45); z-index: 100; justify-content: center; align-items: center; padding: 16px; }
+        .modal { background: var(--card); border: 1px solid var(--border); padding: 18px; border-radius: 12px; width: 100%; max-width: 320px; text-align: center; box-shadow: 0 12px 40px rgba(0,0,0,0.2); }
+        .transfer-active-badge { display: none; background: #fef3c7; color: #b45309; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 6px; }
+        [data-theme="dark"] .transfer-active-badge { background: #78350f; color: #fde68a; }
+        .conn-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px; text-transform: uppercase; letter-spacing: 0.3px; }
+        .empty-hint { color: var(--muted2); font-size: 12px; text-align: center; padding: 16px 8px; }
         @media (max-width: 768px) {
             body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
-            .app-grid { display: flex; flex-direction: column; height: auto; padding: 8px; grid-template-columns: none; overflow: visible; }
-            .card { display: none; height: auto; min-height: calc(100vh - 110px); }
+            .app-grid { display: flex; flex-direction: column; height: auto; padding: 8px; padding-bottom: max(8px, env(safe-area-inset-bottom)); grid-template-columns: none; overflow: visible; gap: 8px; }
+            .card { display: none; height: auto; min-height: calc(100dvh - 120px); }
             .card.mobile-active { display: flex; }
+            header { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
         }
     </style>
 </head>
@@ -543,6 +594,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
                 <span id="room-name">Lobby</span>
             </div>
+            <button class="theme-btn" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle theme">
+                <svg id="theme-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+            </button>
         </div>
     </header>
     <div class="mobile-nav">
@@ -558,36 +612,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
             <div class="card-body">
                 <div>
-                    <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">THIS DEVICE</div>
-                    <div id="my-id" style="font-family:monospace;font-size:13px;font-weight:700;color:#0f172a;">---</div>
+                    <div style="font-size:11px;color:var(--muted2);margin-bottom:2px;">THIS DEVICE</div>
+                    <div id="my-id" style="font-family:ui-monospace,monospace;font-size:14px;font-weight:700;color:var(--text);">---</div>
                 </div>
                 <div class="row">
-                    <input type="text" id="my-name" placeholder="Device Name" class="flex-1">
-                    <button class="flat icon-only" onclick="updateName()" title="Save Name">
+                    <input type="text" id="my-name" placeholder="Device Name" class="flex-1" maxlength="32">
+                    <button class="flat icon-only" onclick="updateName()" title="Save Name" aria-label="Save name">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                     </button>
                 </div>
-                <hr style="border:none;border-top:1px solid #f1f5f9;">
+                <hr style="border:none;border-top:1px solid var(--border);">
                 <div class="row">
-                    <input type="text" id="room-code-input" placeholder="6-digit code" maxlength="6" class="flex-1">
+                    <input type="text" id="room-code-input" placeholder="6-digit code" maxlength="6" inputmode="numeric" pattern="[0-9]*" class="flex-1">
                     <button class="flat" onclick="joinRoom()">Join</button>
                 </div>
                 <div class="row">
-                    <button class="flat flex-1" onclick="createRoom()">Create</button>
-                    <button class="flat icon-only" onclick="leaveRoom()" title="Leave Room">
+                    <button class="flat flex-1" onclick="createRoom()">Create Room</button>
+                    <button class="flat icon-only" onclick="leaveRoom()" title="Leave Room" aria-label="Leave room">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
                     </button>
                 </div>
-                <div class="card-header" style="margin:8px -12px 0 -12px;border-top:1px solid #f1f5f9;">Nearby</div>
+                <div class="card-header" style="margin:8px -12px 0 -12px;border-top:1px solid var(--border);">Nearby</div>
                 <div id="peer-list" style="display:flex;flex-direction:column;gap:6px;">
-                    <div style="color:#94a3b8;font-size:12px;">No devices detected</div>
+                    <div class="empty-hint">No devices detected</div>
                 </div>
             </div>
         </div>
         <div class="card" id="card-transfer">
             <div class="card-header">
                 <span>Transfer</span>
-                <span id="target-peer-label" style="color:#0f172a;text-transform:none;font-weight:600;">To: Everyone</span>
+                <span id="target-peer-label" style="color:var(--text);text-transform:none;font-weight:600;">To: Everyone</span>
             </div>
             <div class="card-body">
                 <div class="row">
@@ -597,18 +651,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="row">
                     <textarea id="text-input" rows="2" placeholder="Message, link, or code..." class="flex-1"></textarea>
-                    <button class="icon-only" onclick="sendText()" title="Send">
+                    <button class="icon-only" onclick="sendText()" title="Send" aria-label="Send text">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
                     </button>
                 </div>
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                     <span>Tap or drag files / photos here</span>
-                    <span style="font-size:11px;color:#94a3b8;">Multi-select -> gallery + ZIP download</span>
+                    <span style="font-size:11px;color:var(--muted2);">Multi-select → gallery + ZIP download</span>
                     <input type="file" id="file-input" multiple accept="*/*" style="display:none;" onchange="handleFileSelect(event)">
                 </div>
                 <div id="progress-wrap" style="display:none;">
-                    <div class="row" style="justify-content:space-between;font-size:11px;color:#64748b;">
+                    <div class="row" style="justify-content:space-between;font-size:11px;color:var(--muted);">
                         <span id="send-status">Sending</span>
                         <span id="send-pct">0%</span>
                     </div>
@@ -621,7 +675,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card" id="card-logs">
             <div class="card-header">
                 <span>Logs</span>
-                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:24px;height:24px;padding:2px;">
+                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:28px;height:28px;padding:2px;" aria-label="Clear logs">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
             </div>
@@ -632,9 +686,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="modal-overlay" id="request-modal">
         <div class="modal">
-            <div style="font-size:14px;font-weight:700;margin-bottom:8px;">Transfer Request</div>
-            <div id="request-details" style="font-size:12px;color:#64748b;margin-bottom:16px;"></div>
-            <div class="row" style="justify-content:center;">
+            <div style="font-size:15px;font-weight:700;margin-bottom:8px;">Transfer Request</div>
+            <div id="request-details" style="font-size:13px;color:var(--muted);margin-bottom:18px;"></div>
+            <div class="row" style="justify-content:center;gap:10px;">
                 <button class="flat" onclick="respondRequest(false)">Decline</button>
                 <button onclick="respondRequest(true)">Accept</button>
             </div>
@@ -655,14 +709,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="lightbox-stage" id="lightbox-stage"></div>
     </div>
 <script>
-
+/* ========== PairMe upgraded client ========== */
 var socket = null;
 var mySid = "";
 var myPeerId = "";
 var peerList = [];
-var connections = {};
+var connections = {};          // sid -> RTCPeerConnection
 var pendingRequest = null;
-var pendingFileQueue = {};
+var pendingFileQueue = {};     // sid -> [{file, transfer_id, ...}]
 var relayFileQueue = {};
 var relayBuffer = {};
 var relayMeta = {};
@@ -671,11 +725,14 @@ var batchStore = {};
 var mediaRegistry = {};
 var lightboxItems = [];
 var lightboxIndex = 0;
-var CHUNK_SIZE = 65536;
+var CHUNK_SIZE = 16384;        // 16KB - most stable across browsers + iOS Safari
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
         {
             urls: [
                 "turn:openrelay.metered.ca:80",
@@ -685,12 +742,15 @@ var STUN_SERVERS = {
             username: "openrelayproject",
             credential: "openrelayproject"
         }
-    ]
+    ],
+    iceCandidatePoolSize: 4
 };
 var WEBRTC_SUPPORTED = (typeof window.RTCPeerConnection === "function");
 var DEVICE_FP = null;
 var activeTransfers = 0;
-var RELAY_BATCH_CONCURRENCY = 2;
+var RELAY_BATCH_CONCURRENCY = 3;
+var P2P_CONNECT_TIMEOUT = 10000; // ms before falling back to relay for a file
+var peerConnState = {};        // sid -> "connecting" | "p2p" | "relay" | "failed"
 
 function switchTab(tab) {
     var cards = ["devices", "transfer", "logs"];
@@ -713,6 +773,7 @@ function log(msg, type) {
     entry.innerHTML = '<span class="log-time">' + time + '</span><span class="log-tag tag-' + type + '">' + type + '</span><span style="word-break:break-all;">' + escapeHtml(msg) + '</span>';
     el.appendChild(entry);
     el.scrollTop = el.scrollHeight;
+    while (el.children.length > 200) el.removeChild(el.firstChild);
 }
 
 function clearLogs() {
@@ -731,6 +792,32 @@ function formatBytes(bytes) {
     var sizes = ["B", "KB", "MB", "GB"];
     var i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+function toggleTheme() {
+    var cur = document.documentElement.getAttribute("data-theme");
+    var next = cur === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    localStorage.setItem("pairme_theme", next);
+    updateThemeIcon(next);
+}
+
+function updateThemeIcon(theme) {
+    var icon = document.getElementById("theme-icon");
+    if (!icon) return;
+    if (theme === "dark") {
+        icon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+    } else {
+        icon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+    }
+}
+
+function initTheme() {
+    var saved = localStorage.getItem("pairme_theme");
+    var preferDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var theme = saved || (preferDark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+    updateThemeIcon(theme);
 }
 
 function renderFormattedContent(text, textId) {
@@ -816,7 +903,7 @@ function showCopySuccess(btnElement, msg) {
     setTimeout(function() {
         btnElement.textContent = originalText;
         btnElement.style.background = "transparent";
-        btnElement.style.color = "#cbd5e1";
+        btnElement.style.color = "";
     }, 1500);
 }
 
@@ -1028,13 +1115,19 @@ function bindSocketEvents() {
     socket.on("peers", function(data) {
         peerList = data;
         renderPeers();
+        // Proactively try to establish P2P with new peers
+        peerList.forEach(function(p) {
+            if (!connections[p.sid] || !isDataChannelOpen(p.sid)) {
+                connectPeer(p.sid, true);
+            }
+        });
     });
 
     socket.on("signal", handleSignal);
 
     socket.on("transfer_request", function(data) {
         pendingRequest = data;
-        document.getElementById("request-details").textContent = data.from_name + " -> " + data.file_name + " (" + formatBytes(data.file_size) + ")";
+        document.getElementById("request-details").textContent = data.from_name + " → " + data.file_name + " (" + formatBytes(data.file_size) + ")";
         document.getElementById("request-modal").style.display = "flex";
     });
 
@@ -1044,17 +1137,33 @@ function bindSocketEvents() {
             startDataTransfer(data.from, data.transfer_id);
         } else {
             log("Declined by peer", "warn");
+            // remove from queue
+            var q = pendingFileQueue[data.from];
+            if (q && q.length && q[0].transfer_id === data.transfer_id) {
+                q.shift();
+            }
         }
     });
 
     socket.on("room_joined", function(data) {
         document.getElementById("room-name").textContent = data.code;
         log("Joined room " + data.code, "success");
+        // close old connections when changing room
+        Object.keys(connections).forEach(function(sid) {
+            try { connections[sid].close(); } catch(e){}
+            delete connections[sid];
+            delete peerConnState[sid];
+        });
     });
 
     socket.on("room_left", function() {
         document.getElementById("room-name").textContent = "Lobby";
         log("Switched to Lobby", "info");
+        Object.keys(connections).forEach(function(sid) {
+            try { connections[sid].close(); } catch(e){}
+            delete connections[sid];
+            delete peerConnState[sid];
+        });
     });
 
     socket.on("relay_text", function(data) {
@@ -1070,10 +1179,14 @@ function bindSocketEvents() {
 
     socket.on("relay_file_chunk", function(data) {
         if (relayBuffer[data.transfer_id]) {
-            var binary = atob(data.chunk);
-            var bytes = new Uint8Array(binary.length);
-            for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            relayBuffer[data.transfer_id][data.seq] = bytes.buffer;
+            try {
+                var binary = atob(data.chunk);
+                var bytes = new Uint8Array(binary.length);
+                for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                relayBuffer[data.transfer_id][data.seq] = bytes.buffer;
+            } catch (e) {
+                log("Chunk decode error", "error");
+            }
         }
     });
 
@@ -1095,7 +1208,7 @@ function bindSocketEvents() {
                 batch_total: meta.batch_total || 1,
                 batch_index: meta.batch_index || 0
             }, meta.from_name);
-            log("Received " + meta.file_name, "success");
+            log("Received " + meta.file_name + " (Relay)", "success");
             delete relayBuffer[data.transfer_id];
             delete relayMeta[data.transfer_id];
         }
@@ -1104,6 +1217,20 @@ function bindSocketEvents() {
     socket.on("rate_limited", function(data) {
         log("Too many requests, slow down (" + data.event + ")", "warn");
     });
+
+    socket.on("disconnect", function() {
+        log("Disconnected from server", "warn");
+    });
+}
+
+function isDataChannelOpen(sid) {
+    var pc = connections[sid];
+    return pc && pc.dataChannel && pc.dataChannel.readyState === "open";
+}
+
+function setPeerConnState(sid, state) {
+    peerConnState[sid] = state;
+    renderPeers(); // refresh status badges
 }
 
 function renderPeers() {
@@ -1113,16 +1240,23 @@ function renderPeers() {
     select.innerHTML = '<option value="">-- All Devices --</option>';
 
     if (peerList.length === 0) {
-        list.innerHTML = '<div style="color:#94a3b8;font-size:12px;">No devices detected</div>';
+        list.innerHTML = '<div class="empty-hint">No devices detected</div>';
         return;
     }
 
     peerList.forEach(function(p) {
+        var state = peerConnState[p.sid] || (isDataChannelOpen(p.sid) ? "p2p" : "relay");
+        var statusHtml = "";
+        if (state === "p2p") statusHtml = '<span class="peer-status status-p2p">P2P</span>';
+        else if (state === "connecting") statusHtml = '<span class="peer-status status-conn">…</span>';
+        else statusHtml = '<span class="peer-status status-relay">Relay</span>';
+
         var item = document.createElement("div");
         item.className = "peer-item";
         item.onclick = function() { selectPeer(p.sid); };
         item.innerHTML = '<div class="peer-info"><span class="peer-name">' + escapeHtml(p.name) + '</span><span class="peer-id">' + p.id + '</span></div>' +
-        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>';
+            '<div style="display:flex;align-items:center;gap:6px;">' + statusHtml +
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>';
         list.appendChild(item);
 
         var opt = document.createElement("option");
@@ -1146,7 +1280,7 @@ function onPeerSelectChange() {
     if (sid) {
         var p = peerList.find(function(x) { return x.sid === sid; });
         label.textContent = "To: " + (p ? p.name : sid);
-        connectPeer(sid);
+        connectPeer(sid, true);
     } else {
         label.textContent = "To: Everyone";
     }
@@ -1169,14 +1303,26 @@ function joinRoom() {
 function createRoom() { socket.emit("create_room_code"); }
 function leaveRoom() { socket.emit("leave_room_code"); }
 
+/* ---------- WebRTC core (fixed) ---------- */
+
 function getOrCreateConnection(targetSid, isInitiator) {
     if (!WEBRTC_SUPPORTED) return null;
-    if (connections[targetSid]) return connections[targetSid];
+    if (connections[targetSid] && connections[targetSid].connectionState !== "closed" && connections[targetSid].connectionState !== "failed") {
+        return connections[targetSid];
+    }
+
+    // clean previous
+    if (connections[targetSid]) {
+        try { connections[targetSid].close(); } catch(e){}
+    }
 
     var pc = new RTCPeerConnection(STUN_SERVERS);
     pc.iceQueue = [];
     pc.targetSid = targetSid;
     pc.receiveBuffer = {};
+    pc._makingOffer = false;
+    pc._ignoreOffer = false;
+    setPeerConnState(targetSid, "connecting");
 
     pc.onicecandidate = function(e) {
         if (e.candidate) {
@@ -1184,10 +1330,40 @@ function getOrCreateConnection(targetSid, isInitiator) {
         }
     };
 
-    pc.ondatachannel = function(e) { setupDataChannel(pc, e.channel, targetSid); };
+    pc.onconnectionstatechange = function() {
+        var st = pc.connectionState;
+        if (st === "connected") {
+            if (isDataChannelOpen(targetSid)) setPeerConnState(targetSid, "p2p");
+        } else if (st === "failed" || st === "disconnected") {
+            log("P2P state " + st + " with " + targetSid.slice(0, 6), "warn");
+            setPeerConnState(targetSid, "failed");
+            // attempt ICE restart once
+            if (!pc._restarted) {
+                pc._restarted = true;
+                try {
+                    pc.restartIce();
+                    if (isInitiator || pc._polite) {
+                        makeOffer(pc, targetSid);
+                    }
+                } catch (err) {}
+            }
+        } else if (st === "closed") {
+            setPeerConnState(targetSid, "relay");
+        }
+    };
+
+    pc.oniceconnectionstatechange = function() {
+        if (pc.iceConnectionState === "failed") {
+            setPeerConnState(targetSid, "failed");
+        }
+    };
+
+    pc.ondatachannel = function(e) {
+        setupDataChannel(pc, e.channel, targetSid);
+    };
 
     if (isInitiator) {
-        var channel = pc.createDataChannel("pairme", { ordered: true });
+        var channel = pc.createDataChannel("pairme", { ordered: true, negotiated: false });
         setupDataChannel(pc, channel, targetSid);
     }
 
@@ -1197,9 +1373,57 @@ function getOrCreateConnection(targetSid, isInitiator) {
 
 function setupDataChannel(pc, channel, targetSid) {
     pc.dataChannel = channel;
-    channel.onopen = function() { log("P2P open with " + targetSid.slice(0, 4), "p2p"); };
-    channel.onmessage = function(e) { handleDataMessage(e.data, targetSid); };
-    channel.onerror = function(err) { log("Channel error: " + err.message, "error"); };
+    channel.binaryType = "arraybuffer";
+
+    // critical for Safari / backpressure
+    try {
+        channel.bufferedAmountLowThreshold = CHUNK_SIZE * 4;
+    } catch (e) {}
+
+    channel.onopen = function() {
+        log("P2P open with " + targetSid.slice(0, 6), "p2p");
+        setPeerConnState(targetSid, "p2p");
+        // if there are pending files waiting for this channel, start them
+        if (pendingFileQueue[targetSid] && pendingFileQueue[targetSid].length) {
+            var first = pendingFileQueue[targetSid][0];
+            socket.emit("broadcast_request", {
+                to: first.target_peer_id,
+                file_name: first.file.name,
+                file_size: first.file.size,
+                file_type: first.file.type,
+                transfer_id: first.transfer_id,
+                batch_id: first.batch_id,
+                batch_total: first.batch_total,
+                batch_index: first.batch_index
+            });
+        }
+    };
+
+    channel.onclose = function() {
+        log("P2P closed " + targetSid.slice(0, 6), "warn");
+        setPeerConnState(targetSid, "relay");
+    };
+
+    channel.onerror = function(err) {
+        log("Channel error: " + (err.message || err), "error");
+        setPeerConnState(targetSid, "failed");
+    };
+
+    channel.onmessage = function(e) {
+        handleDataMessage(e.data, targetSid);
+    };
+}
+
+function makeOffer(pc, targetSid) {
+    if (pc._makingOffer) return;
+    pc._makingOffer = true;
+    pc.createOffer()
+        .then(function(offer) { return pc.setLocalDescription(offer); })
+        .then(function() {
+            socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } });
+        })
+        .catch(function(err) { log("Offer err: " + err.message, "error"); })
+        .finally(function() { pc._makingOffer = false; });
 }
 
 function handleSignal(data) {
@@ -1207,39 +1431,57 @@ function handleSignal(data) {
     var signal = data.signal;
     var pc = getOrCreateConnection(fromSid, false);
 
+    if (!pc) return;
+
     if (signal.type === "offer") {
+        var offerCollision = (pc._makingOffer || pc.signalingState !== "stable");
+        pc._ignoreOffer = !pc._polite && offerCollision;
+        if (pc._ignoreOffer) return;
+
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
             .then(function() {
-                while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
+                while (pc.iceQueue.length) {
+                    pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
+                }
                 return pc.createAnswer();
             })
             .then(function(ans) { return pc.setLocalDescription(ans); })
-            .then(function() { socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } }); })
-            .catch(function(err) { log("Offer err: " + err.message, "error"); });
+            .then(function() {
+                socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } });
+            })
+            .catch(function(err) { log("Offer/answer err: " + err.message, "error"); });
     } else if (signal.type === "answer") {
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
             .then(function() {
-                while (pc.iceQueue.length) pc.addIceCandidate(pc.iceQueue.shift());
+                while (pc.iceQueue.length) {
+                    pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
+                }
             })
             .catch(function(err) { log("Answer err: " + err.message, "error"); });
     } else if (signal.type === "ice") {
         var candidate = new RTCIceCandidate(signal.candidate);
-        if (pc.remoteDescription && pc.remoteDescription.type) pc.addIceCandidate(candidate);
-        else pc.iceQueue.push(candidate);
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+            pc.addIceCandidate(candidate).catch(function(){});
+        } else {
+            pc.iceQueue.push(candidate);
+        }
     }
 }
 
-function connectPeer(targetSid) {
+function connectPeer(targetSid, force) {
     if (!WEBRTC_SUPPORTED) {
-        log("WebRTC not supported on this browser, using relay only", "warn");
+        if (force) log("WebRTC not supported, using relay only", "warn");
         return;
     }
+    if (isDataChannelOpen(targetSid) && !force) return;
+
     var pc = getOrCreateConnection(targetSid, true);
-    pc.createOffer()
-        .then(function(offer) { return pc.setLocalDescription(offer); })
-        .then(function() { socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } }); })
-        .catch(function(err) { log("Offer err: " + err.message, "error"); });
+    // polite peer = lower id for simple perfect negotiation
+    pc._polite = (mySid < targetSid);
+    makeOffer(pc, targetSid);
 }
+
+/* ---------- Send text / files ---------- */
 
 function sendText() {
     var text = document.getElementById("text-input").value.trim();
@@ -1255,15 +1497,16 @@ function sendText() {
 }
 
 function sendTextTo(targetSid, text) {
-    var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
-    if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
-        pc.dataChannel.send(JSON.stringify({ t: "txt", c: text }));
-        log("Sent text (P2P)", "p2p");
-    } else {
-        var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
-        socket.emit("relay_text", { to: (pInfo ? pInfo.id : targetSid), text: text });
-        log("Sent text (Relay)", "info");
+    if (isDataChannelOpen(targetSid)) {
+        try {
+            connections[targetSid].dataChannel.send(JSON.stringify({ t: "txt", c: text }));
+            log("Sent text (P2P)", "p2p");
+            return;
+        } catch (e) {}
     }
+    var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
+    socket.emit("relay_text", { to: (pInfo ? pInfo.id : targetSid), text: text });
+    log("Sent text (Relay)", "info");
 }
 
 function handleFileSelect(e) {
@@ -1300,8 +1543,9 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         batch_index: batchIndex,
         target_peer_id: targetPeerId
     };
-    var pc = WEBRTC_SUPPORTED ? connections[targetSid] : null;
-    if (pc && pc.dataChannel && pc.dataChannel.readyState === "open") {
+
+    // Prefer P2P if already open
+    if (isDataChannelOpen(targetSid)) {
         if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
         pendingFileQueue[targetSid].push(meta);
         if (pendingFileQueue[targetSid].length === 1) {
@@ -1316,13 +1560,41 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
                 batch_index: batchIndex
             });
         }
-    } else {
-        if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
-        relayFileQueue[targetSid].push(meta);
-        if (relayFileQueue[targetSid].length === 1) {
-            processRelayQueue(targetSid);
-        }
+        return;
     }
+
+    // Try to establish P2P first, with timeout fallback to relay
+    connectPeer(targetSid, true);
+    if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
+    pendingFileQueue[targetSid].push(meta);
+
+    var waited = 0;
+    var check = setInterval(function() {
+        waited += 400;
+        if (isDataChannelOpen(targetSid)) {
+            clearInterval(check);
+            // channel open handler will start the queue
+            return;
+        }
+        if (waited >= P2P_CONNECT_TIMEOUT) {
+            clearInterval(check);
+            // move to relay
+            var q = pendingFileQueue[targetSid];
+            if (q) {
+                var idx = q.findIndex(function(m) { return m.transfer_id === transferId; });
+                if (idx >= 0) {
+                    var item = q.splice(idx, 1)[0];
+                    if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
+                    relayFileQueue[targetSid].push(item);
+                    if (relayFileQueue[targetSid].length === 1 || (relayFileQueue[targetSid]._active || 0) < RELAY_BATCH_CONCURRENCY) {
+                        processRelayQueue(targetSid);
+                    }
+                }
+            }
+            setPeerConnState(targetSid, "relay");
+            log("P2P timeout → using Relay for " + file.name, "warn");
+        }
+    }, 400);
 }
 
 function processRelayQueue(targetSid) {
@@ -1343,8 +1615,18 @@ function startDataTransfer(targetSid, transferId) {
     var queue = pendingFileQueue[targetSid];
     if (!queue || !queue.length) return;
     var item = queue[0];
+    if (item.transfer_id !== transferId) return; // safety
+
     var file = item.file;
     var pc = connections[targetSid];
+    if (!pc || !pc.dataChannel || pc.dataChannel.readyState !== "open") {
+        // fallback to relay
+        queue.shift();
+        if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
+        relayFileQueue[targetSid].push(item);
+        processRelayQueue(targetSid);
+        return;
+    }
     var channel = pc.dataChannel;
 
     channel.send(JSON.stringify({
@@ -1363,44 +1645,78 @@ function startDataTransfer(targetSid, transferId) {
         var buffer = e.target.result;
         var offset = 0;
         document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "Sending " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "");
+        document.getElementById("send-status").textContent = "P2P " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "");
         activeTransfers++;
         updateTransferBadge();
 
-        function sendChunk() {
-            while (offset < buffer.byteLength) {
-                if (channel.bufferedAmount > CHUNK_SIZE * 8) {
-                    setTimeout(sendChunk, 20);
-                    return;
+        function sendNext() {
+            if (offset >= buffer.byteLength) {
+                channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
+                log("Sent " + file.name + " (P2P)", "success");
+                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
+                activeTransfers--;
+                updateTransferBadge();
+                queue.shift();
+                if (queue.length) {
+                    var next = queue[0];
+                    socket.emit("broadcast_request", {
+                        to: item.target_peer_id,
+                        file_name: next.file.name,
+                        file_size: next.file.size,
+                        file_type: next.file.type,
+                        transfer_id: next.transfer_id,
+                        batch_id: next.batch_id,
+                        batch_total: next.batch_total,
+                        batch_index: next.batch_index
+                    });
                 }
-                var chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+                return;
+            }
+
+            // backpressure
+            if (channel.bufferedAmount > CHUNK_SIZE * 12) {
+                // wait for low event or poll
+                var onLow = function() {
+                    channel.removeEventListener("bufferedamountlow", onLow);
+                    sendNext();
+                };
+                channel.addEventListener("bufferedamountlow", onLow);
+                // also poll for Safari which sometimes misses the event
+                setTimeout(function() {
+                    if (channel.bufferedAmount <= CHUNK_SIZE * 8) {
+                        channel.removeEventListener("bufferedamountlow", onLow);
+                        sendNext();
+                    }
+                }, 40);
+                return;
+            }
+
+            var chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+            try {
                 channel.send(chunk);
-                offset += CHUNK_SIZE;
-                var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
-                document.getElementById("progress-fill").style.width = pct + "%";
-                document.getElementById("send-pct").textContent = pct + "%";
+            } catch (err) {
+                log("Send chunk failed, falling back to relay", "error");
+                // move remaining to relay roughly (simplified: just current file to relay)
+                activeTransfers--;
+                updateTransferBadge();
+                queue.shift();
+                if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
+                relayFileQueue[targetSid].unshift(item);
+                processRelayQueue(targetSid);
+                return;
             }
-            channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
-            log("Sent " + file.name + " (P2P)", "success");
-            setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
-            activeTransfers--;
-            updateTransferBadge();
-            queue.shift();
-            if (queue.length) {
-                var next = queue[0];
-                socket.emit("broadcast_request", {
-                    to: item.target_peer_id,
-                    file_name: next.file.name,
-                    file_size: next.file.size,
-                    file_type: next.file.type,
-                    transfer_id: next.transfer_id,
-                    batch_id: next.batch_id,
-                    batch_total: next.batch_total,
-                    batch_index: next.batch_index
-                });
+            offset += chunk.byteLength;
+            var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
+            document.getElementById("progress-fill").style.width = pct + "%";
+            document.getElementById("send-pct").textContent = pct + "%";
+            // continue
+            if (typeof requestAnimationFrame === "function") {
+                requestAnimationFrame(sendNext);
+            } else {
+                setTimeout(sendNext, 0);
             }
-        };
-        sendChunk();
+        }
+        sendNext();
     };
     reader.readAsArrayBuffer(file);
 }
@@ -1428,13 +1744,13 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
         var total = bytes.length;
         var offset = 0;
         var inFlight = 0;
-        var MAX_IN_FLIGHT = 10;
-        var MAX_RETRIES = 6;
+        var MAX_IN_FLIGHT = 12;
+        var MAX_RETRIES = 8;
         var aborted = false;
         var sentBytes = 0;
         var seqCounter = 0;
         document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "Sending " + file.name;
+        document.getElementById("send-status").textContent = "Relay " + file.name;
         activeTransfers++;
         updateTransferBadge();
 
@@ -1442,7 +1758,7 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
             if (!aborted && offset >= total && inFlight === 0) {
                 socket.emit("relay_file_done", { to: targetPeerId, transfer_id: transferId });
                 log("Sent " + file.name + " (Relay)", "success");
-                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 800);
+                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
                 activeTransfers--;
                 updateTransferBadge();
                 if (onComplete) onComplete();
@@ -1464,7 +1780,7 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
                         finishIfDone();
                     } else if (attempts < MAX_RETRIES) {
                         attempts++;
-                        setTimeout(attempt, 150 * attempts);
+                        setTimeout(attempt, 120 * attempts);
                     } else {
                         inFlight--;
                         aborted = true;
@@ -1499,37 +1815,45 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
 
 function handleDataMessage(data, fromSid) {
     if (typeof data === "string") {
-        var msg = JSON.parse(data);
-        if (msg.t === "txt") {
-            addReceived("text", msg.c, fromSid);
-        } else if (msg.t === "fs") {
-            var pc = connections[fromSid];
-            pc.activeMeta = msg;
-            pc.receiveBuffer[msg.id] = [];
-        } else if (msg.t === "fe") {
-            var pc = connections[fromSid];
-            var buffers = pc.receiveBuffer[msg.id];
-            if (buffers && pc.activeMeta) {
-                var blob = new Blob(buffers, { type: pc.activeMeta.m });
-                var url = URL.createObjectURL(blob);
-                addReceived("file", {
-                    name: pc.activeMeta.n,
-                    size: pc.activeMeta.s,
-                    url: url,
-                    type: pc.activeMeta.m,
-                    blob: blob,
-                    batch_id: pc.activeMeta.bid || "",
-                    batch_total: pc.activeMeta.bt || 1,
-                    batch_index: pc.activeMeta.bi || 0
-                }, fromSid);
-                log("Received " + pc.activeMeta.n, "success");
-                delete pc.receiveBuffer[msg.id];
+        try {
+            var msg = JSON.parse(data);
+            if (msg.t === "txt") {
+                var name = (peerList.find(function(p){return p.sid===fromSid;}) || {}).name || fromSid.slice(0,6);
+                addReceived("text", msg.c, name);
+            } else if (msg.t === "fs") {
+                var pc = connections[fromSid];
+                if (pc) {
+                    pc.activeMeta = msg;
+                    pc.receiveBuffer[msg.id] = [];
+                }
+            } else if (msg.t === "fe") {
+                var pc2 = connections[fromSid];
+                if (pc2 && pc2.receiveBuffer[msg.id] && pc2.activeMeta) {
+                    var buffers = pc2.receiveBuffer[msg.id];
+                    var blob = new Blob(buffers, { type: pc2.activeMeta.m });
+                    var url = URL.createObjectURL(blob);
+                    var senderName = (peerList.find(function(p){return p.sid===fromSid;}) || {}).name || fromSid.slice(0,6);
+                    addReceived("file", {
+                        name: pc2.activeMeta.n,
+                        size: pc2.activeMeta.s,
+                        url: url,
+                        type: pc2.activeMeta.m,
+                        blob: blob,
+                        batch_id: pc2.activeMeta.bid || "",
+                        batch_total: pc2.activeMeta.bt || 1,
+                        batch_index: pc2.activeMeta.bi || 0
+                    }, senderName);
+                    log("Received " + pc2.activeMeta.n + " (P2P)", "success");
+                    delete pc2.receiveBuffer[msg.id];
+                }
             }
+        } catch (e) {
+            log("Bad data message", "error");
         }
     } else {
-        var pc = connections[fromSid];
-        if (pc && pc.activeMeta && pc.receiveBuffer[pc.activeMeta.id]) {
-            pc.receiveBuffer[pc.activeMeta.id].push(data);
+        var pc3 = connections[fromSid];
+        if (pc3 && pc3.activeMeta && pc3.receiveBuffer[pc3.activeMeta.id]) {
+            pc3.receiveBuffer[pc3.activeMeta.id].push(data);
         }
     }
 }
@@ -1543,6 +1867,8 @@ function updateTransferBadge() {
         badge.style.display = "none";
     }
 }
+
+/* ---------- Media helpers (kept + polished) ---------- */
 
 function guessMimeFromName(name) {
     if (!name) return "";
@@ -1577,25 +1903,10 @@ function isHeicType(type, name) {
     return n.endsWith(".heic") || n.endsWith(".heif");
 }
 
-function isImageType(type) {
-    return !!(type && type.indexOf("image/") === 0);
-}
-
-function isVideoType(type) {
-    return !!(type && type.indexOf("video/") === 0);
-}
-
-function isAudioType(type) {
-    return !!(type && type.indexOf("audio/") === 0);
-}
-
-function isMediaType(type) {
-    return isImageType(type) || isVideoType(type);
-}
-
-function isPlayableType(type) {
-    return isMediaType(type) || isAudioType(type);
-}
+function isImageType(type) { return !!(type && type.indexOf("image/") === 0); }
+function isVideoType(type) { return !!(type && type.indexOf("video/") === 0); }
+function isAudioType(type) { return !!(type && type.indexOf("audio/") === 0); }
+function isMediaType(type) { return isImageType(type) || isVideoType(type); }
 
 function fileExtLabel(name, type) {
     if (name && name.indexOf(".") > -1) {
@@ -1628,7 +1939,6 @@ function prepareItemPreview(item) {
             resolve(item);
             return;
         }
-
         if (typeof heic2any === "undefined") {
             resolve(item);
             return;
@@ -1771,7 +2081,7 @@ function renderBatchBody(batchId) {
             var meta = document.createElement("div");
             meta.className = "batch-file-meta";
             var nameLine = escapeHtml(item.name);
-            if (item.convertedFromHeic) nameLine += ' <span style="color:#94a3b8;font-weight:400;">(HEIC)</span>';
+            if (item.convertedFromHeic) nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC)</span>';
             meta.innerHTML =
                 '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + nameLine + '</span>' +
                 '<span class="batch-file-size">' + formatBytes(item.size) + '</span>';
@@ -1807,7 +2117,7 @@ function addToBatch(batchId, item, sender) {
         var done = batch.items.length;
 
         if (done >= total) {
-            metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " * " +
+            metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " +
                 formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
             renderBatchBody(batchId);
             document.getElementById("batch-actions-" + batchId).style.display = "flex";
@@ -1864,7 +2174,7 @@ function addReceived(type, data, sender) {
         var li = document.createElement("li");
         li.className = "feed-item";
         var mediaId = registerMedia(item);
-        var titleExtra = item.convertedFromHeic ? ' <span style="color:#94a3b8;font-weight:400;font-size:11px;">(HEIC -> preview)</span>' : '';
+        var titleExtra = item.convertedFromHeic ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC → preview)</span>' : '';
         var previewHtml = "";
         if (isImageType(item.type) || item.convertedFromHeic) {
             previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
@@ -2019,9 +2329,16 @@ function respondRequest(accepted) {
 }
 
 var dropZone = document.getElementById("drop-zone");
-dropZone.addEventListener("dragover", function(e) { e.preventDefault(); });
+dropZone.addEventListener("dragover", function(e) {
+    e.preventDefault();
+    dropZone.classList.add("dragover");
+});
+dropZone.addEventListener("dragleave", function() {
+    dropZone.classList.remove("dragover");
+});
 dropZone.addEventListener("drop", function(e) {
     e.preventDefault();
+    dropZone.classList.remove("dragover");
     handleFileSelect({ target: { files: e.dataTransfer.files } });
 });
 
@@ -2035,16 +2352,18 @@ window.addEventListener("beforeunload", function(e) {
 document.addEventListener("visibilitychange", function() {
     if (document.hidden) {
         log("Tab hidden - transfer continues in background", "info");
-    } else {
-        log("Tab visible", "info");
     }
 });
 
-window.onload = initSocket;
+window.onload = function() {
+    initTheme();
+    initSocket();
+};
 </script>
 </body>
 </html>
 """
 
 if __name__ == "__main__":
+    socketio.start_background_task(cleanup_stale_peers)
     socketio.run(app, host="0.0.0.0", port=5000, debug=False)
