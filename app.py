@@ -1115,29 +1115,32 @@ function bindSocketEvents() {
     socket.on("peers", function(data) {
         peerList = data;
         renderPeers();
-        // Proactively try to establish P2P with new peers
+        // Proactively try to establish P2P with new peers (gentle, no force if already trying)
         peerList.forEach(function(p) {
-            if (!connections[p.sid] || !isDataChannelOpen(p.sid)) {
-                connectPeer(p.sid, true);
+            if (!connections[p.sid] || (!isDataChannelOpen(p.sid) && peerConnState[p.sid] !== "connecting" && peerConnState[p.sid] !== "p2p")) {
+                connectPeer(p.sid, false);
             }
         });
     });
 
     socket.on("signal", handleSignal);
 
+    // Auto-accept all transfers in the same room (no per-file modal).
+    // Room code already acts as consent. Much better UX for multi-file batches.
     socket.on("transfer_request", function(data) {
-        pendingRequest = data;
-        document.getElementById("request-details").textContent = data.from_name + " → " + data.file_name + " (" + formatBytes(data.file_size) + ")";
-        document.getElementById("request-modal").style.display = "flex";
+        log("Incoming: " + data.file_name + " from " + data.from_name, "info");
+        socket.emit("broadcast_response", {
+            to: data.from,
+            accepted: true,
+            transfer_id: data.transfer_id
+        });
     });
 
     socket.on("transfer_response", function(data) {
         if (data.accepted) {
-            log("Accepted by peer", "success");
             startDataTransfer(data.from, data.transfer_id);
         } else {
             log("Declined by peer", "warn");
-            // remove from queue
             var q = pendingFileQueue[data.from];
             if (q && q.length && q[0].transfer_id === data.transfer_id) {
                 q.shift();
@@ -1434,30 +1437,53 @@ function handleSignal(data) {
     if (!pc) return;
 
     if (signal.type === "offer") {
+        // Perfect negotiation: only ignore if we are impolite and already making an offer
         var offerCollision = (pc._makingOffer || pc.signalingState !== "stable");
         pc._ignoreOffer = !pc._polite && offerCollision;
-        if (pc._ignoreOffer) return;
+        if (pc._ignoreOffer) {
+            log("Ignoring colliding offer (impolite)", "info");
+            return;
+        }
 
-        pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
-            .then(function() {
-                while (pc.iceQueue.length) {
-                    pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
-                }
-                return pc.createAnswer();
-            })
-            .then(function(ans) { return pc.setLocalDescription(ans); })
-            .then(function() {
-                socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } });
-            })
-            .catch(function(err) { log("Offer/answer err: " + err.message, "error"); });
+        // If we had a local offer and are polite, roll back
+        var doRollback = offerCollision && pc._polite;
+        var p = Promise.resolve();
+        if (doRollback) {
+            p = pc.setLocalDescription({ type: "rollback" }).catch(function(){});
+        }
+
+        p.then(function() {
+            return pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        })
+        .then(function() {
+            while (pc.iceQueue.length) {
+                pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
+            }
+            return pc.createAnswer();
+        })
+        .then(function(ans) { return pc.setLocalDescription(ans); })
+        .then(function() {
+            socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } });
+        })
+        .catch(function(err) { log("Offer/answer err: " + err.message, "error"); });
     } else if (signal.type === "answer") {
+        // Only apply answer when we are waiting for it (have-local-offer)
+        if (pc.signalingState !== "have-local-offer") {
+            // Already stable or wrong state — ignore to avoid the common error
+            return;
+        }
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
             .then(function() {
                 while (pc.iceQueue.length) {
                     pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
                 }
             })
-            .catch(function(err) { log("Answer err: " + err.message, "error"); });
+            .catch(function(err) {
+                // Ignore "wrong state: stable" which happens with glare
+                if (String(err.message || err).indexOf("stable") === -1) {
+                    log("Answer err: " + err.message, "error");
+                }
+            });
     } else if (signal.type === "ice") {
         var candidate = new RTCIceCandidate(signal.candidate);
         if (pc.remoteDescription && pc.remoteDescription.type) {
@@ -1904,9 +1930,21 @@ function isHeicType(type, name) {
 }
 
 function isImageType(type) { return !!(type && type.indexOf("image/") === 0); }
-function isVideoType(type) { return !!(type && type.indexOf("video/") === 0); }
+function isVideoType(type) {
+    if (type && type.indexOf("video/") === 0) return true;
+    return false;
+}
 function isAudioType(type) { return !!(type && type.indexOf("audio/") === 0); }
 function isMediaType(type) { return isImageType(type) || isVideoType(type); }
+
+// Live Photo = HEIC still + paired short MOV. Browser can only show the still
+// (converted to JPEG). To see motion, send the .MOV file as well (iPhone Photos
+// usually exports both when you share "Live Photo").
+function isLikelyLivePhotoPair(name) {
+    if (!name) return false;
+    var n = name.toLowerCase();
+    return n.indexOf("live") >= 0 || n.indexOf("img_") === 0;
+}
 
 function fileExtLabel(name, type) {
     if (name && name.indexOf(".") > -1) {
@@ -2081,7 +2119,7 @@ function renderBatchBody(batchId) {
             var meta = document.createElement("div");
             meta.className = "batch-file-meta";
             var nameLine = escapeHtml(item.name);
-            if (item.convertedFromHeic) nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC)</span>';
+            if (item.convertedFromHeic) nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC still)</span>';
             meta.innerHTML =
                 '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + nameLine + '</span>' +
                 '<span class="batch-file-size">' + formatBytes(item.size) + '</span>';
@@ -2174,7 +2212,9 @@ function addReceived(type, data, sender) {
         var li = document.createElement("li");
         li.className = "feed-item";
         var mediaId = registerMedia(item);
-        var titleExtra = item.convertedFromHeic ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC → preview)</span>' : '';
+        var titleExtra = item.convertedFromHeic
+            ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC still · gửi thêm .MOV nếu là Live Photo)</span>'
+            : '';
         var previewHtml = "";
         if (isImageType(item.type) || item.convertedFromHeic) {
             previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
