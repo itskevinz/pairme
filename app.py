@@ -17,6 +17,8 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
+APP_VERSION = "2.1.0"
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
 
@@ -150,12 +152,12 @@ def cleanup_stale_peers():
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, app_version=APP_VERSION)
 
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "peers": len(peers)}, 200
+    return {"status": "ok", "peers": len(peers), "version": APP_VERSION}, 200
 
 
 @socketio.on("connect")
@@ -227,6 +229,9 @@ def handle_join_room_code(data):
         emit("room_error", {"msg": "Invalid code"})
         return
     old_room = peers[sid].get("room")
+    if old_room == code:
+        emit("room_joined", {"code": code})
+        return
     leave_current_room(sid)
     join_room(code)
     peers[sid]["room"] = code
@@ -253,7 +258,7 @@ def handle_create_room_code():
     peers[sid]["room"] = code
     peer_last_room[peers[sid]["id"]] = code
     rooms_index[code] = {sid}
-    emit("room_joined", {"code": code})
+    emit("room_joined", {"code": code, "created": True})
     broadcast_peers(code)
     if old_room:
         broadcast_peers(old_room)
@@ -425,6 +430,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
     <style>
         :root {
             --bg: #f8fafc;
@@ -463,8 +469,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         header { background: var(--card); padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; padding-top: max(10px, env(safe-area-inset-top)); }
         .brand { font-size: 16px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; display: flex; align-items: center; gap: 8px; }
         .brand img { width: 22px; height: 22px; border-radius: 5px; object-fit: cover; }
+        .version-badge { font-size: 10px; font-weight: 600; color: var(--muted); background: var(--accent-soft); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; letter-spacing: 0; }
         .room-tag { background: var(--accent-soft); color: var(--muted); padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); display: flex; align-items: center; gap: 5px; }
-        .theme-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .theme-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; min-height: 34px; }
         .mobile-nav { display: none; background: var(--card); border-bottom: 1px solid var(--border); flex-shrink: 0; }
         .mobile-nav button { flex: 1; background: transparent; border: none; border-bottom: 2px solid transparent; padding: 12px 0; color: var(--muted); font-size: 13px; font-weight: 600; border-radius: 0; min-height: 44px; }
         .mobile-nav button.active { color: var(--text); border-bottom-color: var(--text); background: transparent; }
@@ -478,6 +485,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         button:active { opacity: 0.8; }
         button.flat { background: var(--card); color: var(--text); border: 1px solid var(--border); }
         button.icon-only { padding: 8px; width: 38px; height: 38px; flex-shrink: 0; }
+        button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
         .row { display: flex; gap: 8px; align-items: center; }
         .flex-1 { flex: 1; min-width: 0; }
         .peer-item { background: var(--card); border: 1px solid var(--border); padding: 10px 12px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: border-color 0.15s, background 0.15s; min-height: 48px; }
@@ -505,7 +513,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         [data-theme="dark"] .text-link { color: #60a5fa; }
         .code-wrapper { margin: 6px 0; border-radius: 8px; overflow: hidden; background: #0f172a; border: 1px solid #1e293b; }
         .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 5px 10px; font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace; }
-        .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 5px; padding: 3px 8px; font-size: 10px; cursor: pointer; }
+        .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 5px; padding: 3px 8px; font-size: 10px; cursor: pointer; min-height: 0; }
         .copy-btn:active { background: #334155; }
         .code-block { color: #f8fafc; padding: 10px; font-family: ui-monospace, Consolas, Monaco, monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
         .inline-code { background: var(--accent-soft); color: var(--text); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
@@ -513,7 +521,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .expandable-block.expanded { max-height: none !important; }
         .expandable-overlay { position: absolute; bottom: 0; left: 0; right: 0; height: 60px; background: linear-gradient(to bottom, transparent, var(--card)); pointer-events: none; display: flex; align-items: flex-end; justify-content: center; padding-bottom: 4px; }
         .expandable-block.expanded .expandable-overlay { display: none; }
-        .expand-toggle-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); font-size: 11px; font-weight: 600; padding: 4px 12px; border-radius: 14px; cursor: pointer; pointer-events: auto; box-shadow: var(--shadow); }
+        .expand-toggle-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); font-size: 11px; font-weight: 600; padding: 4px 12px; border-radius: 14px; cursor: pointer; pointer-events: auto; box-shadow: var(--shadow); min-height: 0; }
         .file-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--accent-soft); border: 1px solid var(--border); padding: 10px; border-radius: 8px; }
         .file-meta { display: flex; flex-direction: column; min-width: 0; flex: 1; }
         .file-title { font-weight: 600; font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -572,6 +580,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         [data-theme="dark"] .transfer-active-badge { background: #78350f; color: #fde68a; }
         .conn-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 5px; text-transform: uppercase; letter-spacing: 0.3px; }
         .empty-hint { color: var(--muted2); font-size: 12px; text-align: center; padding: 16px 8px; }
+
+        .share-btn { background: var(--accent); color: var(--bg); border: 1px solid var(--accent); border-radius: 8px; height: 34px; min-height: 34px; padding: 0 12px; font-size: 12px; font-weight: 600; }
+        .share-modal { max-width: 340px; padding: 22px 20px 18px; }
+        .share-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+        .share-sub { font-size: 12px; color: var(--muted); margin-bottom: 14px; line-height: 1.45; }
+        .qr-frame { background: #ffffff; border: 1px solid var(--border); border-radius: 12px; padding: 12px; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+        .qr-frame svg, .qr-frame img { display: block; width: 216px; height: 216px; }
+        .qr-fallback { width: 216px; height: 216px; display: flex; align-items: center; justify-content: center; color: #475569; font-size: 12px; text-align: center; padding: 12px; }
+        .share-code { font-family: ui-monospace, Consolas, monospace; font-size: 26px; font-weight: 800; letter-spacing: 6px; color: var(--text); margin-bottom: 2px; }
+        .share-code-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted2); margin-bottom: 12px; }
+        .share-link { font-size: 11px; color: var(--muted); background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; word-break: break-all; margin-bottom: 12px; text-align: left; font-family: ui-monospace, monospace; }
+        .share-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+        .share-close { margin-top: 10px; width: 100%; }
+        .toast { position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s; z-index: 300; }
+        .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
         @media (max-width: 768px) {
             body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
@@ -579,6 +603,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             .card { display: none; height: auto; min-height: calc(100dvh - 120px); }
             .card.mobile-active { display: flex; }
             header { padding-left: max(12px, env(safe-area-inset-left)); padding-right: max(12px, env(safe-area-inset-right)); }
+            .share-label { display: none; }
+            .share-btn { width: 34px; padding: 0; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            * { transition: none !important; animation: none !important; }
         }
     </style>
 </head>
@@ -587,9 +616,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="brand">
             <img src="https://imgg.fr/r/LkSsr60e.png" alt="Logo">
             PairMe
+            <span class="version-badge">v{{ app_version }}</span>
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
             <span class="transfer-active-badge" id="transfer-badge">Transferring</span>
+            <button class="share-btn" onclick="openShareModal()" title="Share via QR code" aria-label="Share via QR code">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20v.01M17 20h4v-3"/></svg>
+                <span class="share-label">QR</span>
+            </button>
             <div class="room-tag" id="room-badge">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
                 <span id="room-name">Lobby</span>
@@ -675,7 +709,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="card" id="card-logs">
             <div class="card-header">
                 <span>Logs</span>
-                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:28px;height:28px;padding:2px;" aria-label="Clear logs">
+                <button class="flat icon-only" onclick="clearLogs()" title="Clear Logs" style="width:28px;height:28px;padding:2px;min-height:28px;" aria-label="Clear logs">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                 </button>
             </div>
@@ -694,6 +728,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
     </div>
+
+    <div class="modal-overlay" id="share-modal" onclick="if(event.target===this) closeShareModal()">
+        <div class="modal share-modal" role="dialog" aria-modal="true" aria-labelledby="share-title">
+            <div class="share-title" id="share-title">Scan to connect</div>
+            <div class="share-sub">Open the camera on another device and scan. It joins this room and can send files right away.</div>
+            <div class="qr-frame" id="qr-frame"></div>
+            <div class="share-code" id="share-code">------</div>
+            <div class="share-code-label">Room code</div>
+            <div class="share-link" id="share-link"></div>
+            <div class="share-actions">
+                <button class="flat" onclick="copyShareLink(this)">Copy link</button>
+                <button class="flat" id="native-share-btn" onclick="nativeShare()" style="display:none;">Share…</button>
+            </div>
+            <button class="share-close" onclick="closeShareModal()">Done</button>
+        </div>
+    </div>
+
     <div class="lightbox" id="lightbox" onclick="if(event.target===this) closeLightbox()">
         <div class="lightbox-toolbar">
             <span class="lightbox-counter" id="lightbox-counter">1 / 1</span>
@@ -708,15 +759,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div class="lightbox-stage" id="lightbox-stage"></div>
     </div>
+    <div class="toast" id="toast"></div>
 <script>
-/* ========== PairMe upgraded client ========== */
+/* ========== PairMe client ========== */
 var socket = null;
 var mySid = "";
 var myPeerId = "";
+var currentRoom = "Lobby";
 var peerList = [];
-var connections = {};          // sid -> RTCPeerConnection
+var connections = {};
 var pendingRequest = null;
-var pendingFileQueue = {};     // sid -> [{file, transfer_id, ...}]
+var pendingFileQueue = {};
 var relayFileQueue = {};
 var relayBuffer = {};
 var relayMeta = {};
@@ -725,7 +778,7 @@ var batchStore = {};
 var mediaRegistry = {};
 var lightboxItems = [];
 var lightboxIndex = 0;
-var CHUNK_SIZE = 16384;        // 16KB - most stable across browsers + iOS Safari
+var CHUNK_SIZE = 16384;
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
@@ -749,8 +802,11 @@ var WEBRTC_SUPPORTED = (typeof window.RTCPeerConnection === "function");
 var DEVICE_FP = null;
 var activeTransfers = 0;
 var RELAY_BATCH_CONCURRENCY = 3;
-var P2P_CONNECT_TIMEOUT = 10000; // ms before falling back to relay for a file
-var peerConnState = {};        // sid -> "connecting" | "p2p" | "relay" | "failed"
+var P2P_CONNECT_TIMEOUT = 10000;
+var peerConnState = {};
+var pendingShareOpen = false;
+var urlRoomCode = null;
+var toastTimer = null;
 
 function switchTab(tab) {
     var cards = ["devices", "transfer", "logs"];
@@ -778,6 +834,14 @@ function log(msg, type) {
 
 function clearLogs() {
     document.getElementById("log-container").innerHTML = "";
+}
+
+function showToast(msg) {
+    var t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function() { t.classList.remove("show"); }, 2200);
 }
 
 function escapeHtml(text) {
@@ -819,6 +883,100 @@ function initTheme() {
     document.documentElement.setAttribute("data-theme", theme);
     updateThemeIcon(theme);
 }
+
+/* ---------- QR / Share ---------- */
+
+function readRoomFromUrl() {
+    try {
+        var params = new URLSearchParams(window.location.search);
+        var code = (params.get("room") || "").trim();
+        if (/^\d{6}$/.test(code)) return code;
+    } catch (e) {}
+    return null;
+}
+
+function buildShareLink(code) {
+    var base = window.location.origin + window.location.pathname;
+    return base + "?room=" + encodeURIComponent(code);
+}
+
+function syncUrlWithRoom(code) {
+    try {
+        var url = new URL(window.location.href);
+        if (code && code !== "Lobby") {
+            url.searchParams.set("room", code);
+        } else {
+            url.searchParams.delete("room");
+        }
+        window.history.replaceState({}, "", url.toString());
+    } catch (e) {}
+}
+
+function renderQr(link) {
+    var frame = document.getElementById("qr-frame");
+    frame.innerHTML = "";
+    if (typeof qrcode !== "function") {
+        frame.innerHTML = '<div class="qr-fallback">QR library could not load. Use the room code or link below.</div>';
+        return;
+    }
+    try {
+        var qr = qrcode(0, "M");
+        qr.addData(link);
+        qr.make();
+        frame.innerHTML = qr.createSvgTag({ cellSize: 6, margin: 0, scalable: true });
+        var svg = frame.querySelector("svg");
+        if (svg) {
+            svg.setAttribute("width", "216");
+            svg.setAttribute("height", "216");
+            svg.setAttribute("role", "img");
+            svg.setAttribute("aria-label", "QR code to join room " + currentRoom);
+        }
+    } catch (e) {
+        frame.innerHTML = '<div class="qr-fallback">Could not build QR code. Use the room code or link below.</div>';
+    }
+}
+
+function populateShareModal() {
+    var link = buildShareLink(currentRoom);
+    document.getElementById("share-code").textContent = currentRoom;
+    document.getElementById("share-link").textContent = link;
+    renderQr(link);
+    document.getElementById("native-share-btn").style.display = (navigator.share ? "inline-flex" : "none");
+}
+
+function openShareModal() {
+    if (!socket || !socket.connected) {
+        showToast("Still connecting, try again in a moment");
+        return;
+    }
+    if (currentRoom === "Lobby") {
+        pendingShareOpen = true;
+        socket.emit("create_room_code");
+        return;
+    }
+    populateShareModal();
+    document.getElementById("share-modal").style.display = "flex";
+}
+
+function closeShareModal() {
+    document.getElementById("share-modal").style.display = "none";
+}
+
+function copyShareLink(btn) {
+    var link = buildShareLink(currentRoom);
+    copyToClipboard(link, btn, "Copied!");
+}
+
+function nativeShare() {
+    if (!navigator.share) return;
+    navigator.share({
+        title: "Join my PairMe room",
+        text: "Join room " + currentRoom + " on PairMe to share files with me.",
+        url: buildShareLink(currentRoom)
+    }).catch(function() {});
+}
+
+/* ---------- Formatting ---------- */
 
 function renderFormattedContent(text, textId) {
     if (!text) return "";
@@ -897,13 +1055,15 @@ function fallbackCopy(str, btnElement, msg) {
 
 function showCopySuccess(btnElement, msg) {
     var originalText = btnElement.textContent;
+    var originalBg = btnElement.style.background;
+    var originalColor = btnElement.style.color;
     btnElement.textContent = msg;
     btnElement.style.background = "#16a34a";
     btnElement.style.color = "#ffffff";
     setTimeout(function() {
         btnElement.textContent = originalText;
-        btnElement.style.background = "transparent";
-        btnElement.style.color = "";
+        btnElement.style.background = originalBg;
+        btnElement.style.color = originalColor;
     }, 1500);
 }
 
@@ -935,6 +1095,8 @@ function checkAutoExpand(blockId, overlayId) {
 function generateTransferId() {
     return Date.now() + "_" + Math.floor(Math.random() * 100000);
 }
+
+/* ---------- Fingerprint ---------- */
 
 function fnv1aHash(str) {
     var h = 0x811c9dc5;
@@ -1073,6 +1235,8 @@ function getOrComputeFingerprint() {
     });
 }
 
+/* ---------- Socket ---------- */
+
 function initSocket() {
     getOrComputeFingerprint().then(function(fp) {
         socket = io({
@@ -1089,6 +1253,14 @@ function initSocket() {
     });
 }
 
+function closeAllConnections() {
+    Object.keys(connections).forEach(function(sid) {
+        try { connections[sid].close(); } catch(e){}
+        delete connections[sid];
+        delete peerConnState[sid];
+    });
+}
+
 function bindSocketEvents() {
     socket.on("connect", function() {
         log("Connected to server", "success");
@@ -1102,20 +1274,26 @@ function bindSocketEvents() {
     socket.on("init", function(data) {
         mySid = data.sid;
         myPeerId = data.peer_id;
+        currentRoom = data.room || "Lobby";
         document.getElementById("my-id").textContent = myPeerId;
-        if (data.room && data.room !== "Lobby") {
-            document.getElementById("room-name").textContent = data.room;
-        }
+        document.getElementById("room-name").textContent = currentRoom;
         if (data.name) {
             document.getElementById("my-name").value = data.name;
         }
         log("ID: " + myPeerId, "info");
+
+        if (urlRoomCode && urlRoomCode !== currentRoom) {
+            log("Joining room from QR link: " + urlRoomCode, "info");
+            socket.emit("join_room_code", { code: urlRoomCode });
+        } else {
+            syncUrlWithRoom(currentRoom);
+        }
+        urlRoomCode = null;
     });
 
     socket.on("peers", function(data) {
         peerList = data;
         renderPeers();
-        // Proactively try to establish P2P with new peers (gentle, no force if already trying)
         peerList.forEach(function(p) {
             if (!connections[p.sid] || (!isDataChannelOpen(p.sid) && peerConnState[p.sid] !== "connecting" && peerConnState[p.sid] !== "p2p")) {
                 connectPeer(p.sid, false);
@@ -1125,8 +1303,6 @@ function bindSocketEvents() {
 
     socket.on("signal", handleSignal);
 
-    // Auto-accept all transfers in the same room (no per-file modal).
-    // Room code already acts as consent. Much better UX for multi-file batches.
     socket.on("transfer_request", function(data) {
         log("Incoming: " + data.file_name + " from " + data.from_name, "info");
         socket.emit("broadcast_response", {
@@ -1149,24 +1325,32 @@ function bindSocketEvents() {
     });
 
     socket.on("room_joined", function(data) {
+        currentRoom = data.code;
         document.getElementById("room-name").textContent = data.code;
+        syncUrlWithRoom(data.code);
         log("Joined room " + data.code, "success");
-        // close old connections when changing room
-        Object.keys(connections).forEach(function(sid) {
-            try { connections[sid].close(); } catch(e){}
-            delete connections[sid];
-            delete peerConnState[sid];
-        });
+        closeAllConnections();
+        if (pendingShareOpen) {
+            pendingShareOpen = false;
+            populateShareModal();
+            document.getElementById("share-modal").style.display = "flex";
+        } else if (document.getElementById("share-modal").style.display === "flex") {
+            populateShareModal();
+        }
     });
 
     socket.on("room_left", function() {
+        currentRoom = "Lobby";
         document.getElementById("room-name").textContent = "Lobby";
+        syncUrlWithRoom("Lobby");
+        closeShareModal();
         log("Switched to Lobby", "info");
-        Object.keys(connections).forEach(function(sid) {
-            try { connections[sid].close(); } catch(e){}
-            delete connections[sid];
-            delete peerConnState[sid];
-        });
+        closeAllConnections();
+    });
+
+    socket.on("room_error", function(data) {
+        log("Room error: " + (data && data.msg ? data.msg : "unknown"), "error");
+        showToast("Invalid room code");
     });
 
     socket.on("relay_text", function(data) {
@@ -1233,12 +1417,13 @@ function isDataChannelOpen(sid) {
 
 function setPeerConnState(sid, state) {
     peerConnState[sid] = state;
-    renderPeers(); // refresh status badges
+    renderPeers();
 }
 
 function renderPeers() {
     var list = document.getElementById("peer-list");
     var select = document.getElementById("peer-select");
+    var selected = select.value;
     list.innerHTML = "";
     select.innerHTML = '<option value="">-- All Devices --</option>';
 
@@ -1267,6 +1452,7 @@ function renderPeers() {
         opt.textContent = p.name + " (" + p.id + ")";
         select.appendChild(opt);
     });
+    if (selected) select.value = selected;
 }
 
 function selectPeer(sid) {
@@ -1306,7 +1492,7 @@ function joinRoom() {
 function createRoom() { socket.emit("create_room_code"); }
 function leaveRoom() { socket.emit("leave_room_code"); }
 
-/* ---------- WebRTC core (fixed) ---------- */
+/* ---------- WebRTC ---------- */
 
 function getOrCreateConnection(targetSid, isInitiator) {
     if (!WEBRTC_SUPPORTED) return null;
@@ -1314,7 +1500,6 @@ function getOrCreateConnection(targetSid, isInitiator) {
         return connections[targetSid];
     }
 
-    // clean previous
     if (connections[targetSid]) {
         try { connections[targetSid].close(); } catch(e){}
     }
@@ -1325,6 +1510,7 @@ function getOrCreateConnection(targetSid, isInitiator) {
     pc.receiveBuffer = {};
     pc._makingOffer = false;
     pc._ignoreOffer = false;
+    pc._polite = (mySid < targetSid);
     setPeerConnState(targetSid, "connecting");
 
     pc.onicecandidate = function(e) {
@@ -1340,7 +1526,6 @@ function getOrCreateConnection(targetSid, isInitiator) {
         } else if (st === "failed" || st === "disconnected") {
             log("P2P state " + st + " with " + targetSid.slice(0, 6), "warn");
             setPeerConnState(targetSid, "failed");
-            // attempt ICE restart once
             if (!pc._restarted) {
                 pc._restarted = true;
                 try {
@@ -1378,7 +1563,6 @@ function setupDataChannel(pc, channel, targetSid) {
     pc.dataChannel = channel;
     channel.binaryType = "arraybuffer";
 
-    // critical for Safari / backpressure
     try {
         channel.bufferedAmountLowThreshold = CHUNK_SIZE * 4;
     } catch (e) {}
@@ -1386,7 +1570,6 @@ function setupDataChannel(pc, channel, targetSid) {
     channel.onopen = function() {
         log("P2P open with " + targetSid.slice(0, 6), "p2p");
         setPeerConnState(targetSid, "p2p");
-        // if there are pending files waiting for this channel, start them
         if (pendingFileQueue[targetSid] && pendingFileQueue[targetSid].length) {
             var first = pendingFileQueue[targetSid][0];
             socket.emit("broadcast_request", {
@@ -1437,7 +1620,6 @@ function handleSignal(data) {
     if (!pc) return;
 
     if (signal.type === "offer") {
-        // Perfect negotiation: only ignore if we are impolite and already making an offer
         var offerCollision = (pc._makingOffer || pc.signalingState !== "stable");
         pc._ignoreOffer = !pc._polite && offerCollision;
         if (pc._ignoreOffer) {
@@ -1445,7 +1627,6 @@ function handleSignal(data) {
             return;
         }
 
-        // If we had a local offer and are polite, roll back
         var doRollback = offerCollision && pc._polite;
         var p = Promise.resolve();
         if (doRollback) {
@@ -1467,9 +1648,7 @@ function handleSignal(data) {
         })
         .catch(function(err) { log("Offer/answer err: " + err.message, "error"); });
     } else if (signal.type === "answer") {
-        // Only apply answer when we are waiting for it (have-local-offer)
         if (pc.signalingState !== "have-local-offer") {
-            // Already stable or wrong state — ignore to avoid the common error
             return;
         }
         pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
@@ -1479,7 +1658,6 @@ function handleSignal(data) {
                 }
             })
             .catch(function(err) {
-                // Ignore "wrong state: stable" which happens with glare
                 if (String(err.message || err).indexOf("stable") === -1) {
                     log("Answer err: " + err.message, "error");
                 }
@@ -1502,7 +1680,6 @@ function connectPeer(targetSid, force) {
     if (isDataChannelOpen(targetSid) && !force) return;
 
     var pc = getOrCreateConnection(targetSid, true);
-    // polite peer = lower id for simple perfect negotiation
     pc._polite = (mySid < targetSid);
     makeOffer(pc, targetSid);
 }
@@ -1538,6 +1715,11 @@ function sendTextTo(targetSid, text) {
 function handleFileSelect(e) {
     var files = e.target.files || (e.dataTransfer && e.dataTransfer.files);
     if (!files || !files.length) return;
+    if (!peerList.length) {
+        showToast("No devices yet. Tap QR to invite one.");
+        log("No devices to send to", "warn");
+        return;
+    }
     var targetSid = document.getElementById("peer-select").value;
     var batchId = "b_" + generateTransferId();
     var fileArr = Array.prototype.slice.call(files);
@@ -1570,7 +1752,6 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         target_peer_id: targetPeerId
     };
 
-    // Prefer P2P if already open
     if (isDataChannelOpen(targetSid)) {
         if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
         pendingFileQueue[targetSid].push(meta);
@@ -1589,7 +1770,6 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         return;
     }
 
-    // Try to establish P2P first, with timeout fallback to relay
     connectPeer(targetSid, true);
     if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
     pendingFileQueue[targetSid].push(meta);
@@ -1599,12 +1779,10 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         waited += 400;
         if (isDataChannelOpen(targetSid)) {
             clearInterval(check);
-            // channel open handler will start the queue
             return;
         }
         if (waited >= P2P_CONNECT_TIMEOUT) {
             clearInterval(check);
-            // move to relay
             var q = pendingFileQueue[targetSid];
             if (q) {
                 var idx = q.findIndex(function(m) { return m.transfer_id === transferId; });
@@ -1618,7 +1796,7 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
                 }
             }
             setPeerConnState(targetSid, "relay");
-            log("P2P timeout → using Relay for " + file.name, "warn");
+            log("P2P timeout, using Relay for " + file.name, "warn");
         }
     }, 400);
 }
@@ -1641,12 +1819,11 @@ function startDataTransfer(targetSid, transferId) {
     var queue = pendingFileQueue[targetSid];
     if (!queue || !queue.length) return;
     var item = queue[0];
-    if (item.transfer_id !== transferId) return; // safety
+    if (item.transfer_id !== transferId) return;
 
     var file = item.file;
     var pc = connections[targetSid];
     if (!pc || !pc.dataChannel || pc.dataChannel.readyState !== "open") {
-        // fallback to relay
         queue.shift();
         if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
         relayFileQueue[targetSid].push(item);
@@ -1699,15 +1876,12 @@ function startDataTransfer(targetSid, transferId) {
                 return;
             }
 
-            // backpressure
             if (channel.bufferedAmount > CHUNK_SIZE * 12) {
-                // wait for low event or poll
                 var onLow = function() {
                     channel.removeEventListener("bufferedamountlow", onLow);
                     sendNext();
                 };
                 channel.addEventListener("bufferedamountlow", onLow);
-                // also poll for Safari which sometimes misses the event
                 setTimeout(function() {
                     if (channel.bufferedAmount <= CHUNK_SIZE * 8) {
                         channel.removeEventListener("bufferedamountlow", onLow);
@@ -1722,7 +1896,6 @@ function startDataTransfer(targetSid, transferId) {
                 channel.send(chunk);
             } catch (err) {
                 log("Send chunk failed, falling back to relay", "error");
-                // move remaining to relay roughly (simplified: just current file to relay)
                 activeTransfers--;
                 updateTransferBadge();
                 queue.shift();
@@ -1735,7 +1908,6 @@ function startDataTransfer(targetSid, transferId) {
             var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
             document.getElementById("progress-fill").style.width = pct + "%";
             document.getElementById("send-pct").textContent = pct + "%";
-            // continue
             if (typeof requestAnimationFrame === "function") {
                 requestAnimationFrame(sendNext);
             } else {
@@ -1761,8 +1933,6 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
     var reader = new FileReader();
     reader.onerror = function() {
         log("Failed to read " + file.name, "error");
-        activeTransfers--;
-        updateTransferBadge();
         if (onComplete) onComplete();
     };
     reader.onload = function(e) {
@@ -1894,7 +2064,7 @@ function updateTransferBadge() {
     }
 }
 
-/* ---------- Media helpers (kept + polished) ---------- */
+/* ---------- Media helpers ---------- */
 
 function guessMimeFromName(name) {
     if (!name) return "";
@@ -1936,15 +2106,6 @@ function isVideoType(type) {
 }
 function isAudioType(type) { return !!(type && type.indexOf("audio/") === 0); }
 function isMediaType(type) { return isImageType(type) || isVideoType(type); }
-
-// Live Photo = HEIC still + paired short MOV. Browser can only show the still
-// (converted to JPEG). To see motion, send the .MOV file as well (iPhone Photos
-// usually exports both when you share "Live Photo").
-function isLikelyLivePhotoPair(name) {
-    if (!name) return false;
-    var n = name.toLowerCase();
-    return n.indexOf("live") >= 0 || n.indexOf("img_") === 0;
-}
 
 function fileExtLabel(name, type) {
     if (name && name.indexOf(".") > -1) {
@@ -2353,6 +2514,10 @@ function downloadBatchZip(batchId) {
 }
 
 document.addEventListener("keydown", function(e) {
+    if (e.key === "Escape") {
+        var sm = document.getElementById("share-modal");
+        if (sm && sm.style.display === "flex") { closeShareModal(); return; }
+    }
     var lb = document.getElementById("lightbox");
     if (!lb || !lb.classList.contains("open")) return;
     if (e.key === "Escape") closeLightbox();
@@ -2397,6 +2562,10 @@ document.addEventListener("visibilitychange", function() {
 
 window.onload = function() {
     initTheme();
+    urlRoomCode = readRoomFromUrl();
+    if (urlRoomCode) {
+        switchTab("transfer");
+    }
     initSocket();
 };
 </script>
