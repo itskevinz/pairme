@@ -17,7 +17,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
@@ -445,6 +445,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             --warn: #b45309;
             --error: #b91c1c;
             --p2p: #6b21a8;
+            --live: #f59e0b;
             --shadow: 0 1px 2px rgba(0,0,0,0.04);
             --radius: 10px;
         }
@@ -461,6 +462,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             --warn: #fbbf24;
             --error: #f87171;
             --p2p: #c084fc;
+            --live: #fbbf24;
             --shadow: 0 1px 3px rgba(0,0,0,0.35);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; -webkit-tap-highlight-color: transparent; }
@@ -483,6 +485,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         input:focus, select:focus, textarea:focus { border-color: var(--text); }
         button { background: var(--accent); color: var(--bg); border: 1px solid var(--accent); border-radius: 8px; font-size: 13px; font-weight: 500; padding: 9px 14px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-appearance: none; min-height: 38px; transition: opacity 0.15s; }
         button:active { opacity: 0.8; }
+        button:disabled { opacity: 0.55; cursor: default; }
         button.flat { background: var(--card); color: var(--text); border: 1px solid var(--border); }
         button.icon-only { padding: 8px; width: 38px; height: 38px; flex-shrink: 0; }
         button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
@@ -528,7 +531,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .file-size { font-size: 11px; color: var(--muted); }
         .file-preview { margin-top: 4px; text-align: center; background: #0f172a; border-radius: 8px; overflow: hidden; max-height: 240px; display: flex; align-items: center; justify-content: center; }
         .preview-img { max-width: 100%; max-height: 240px; object-fit: contain; display: block; }
-        .action-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; font-size: 11px; border-radius: 6px; font-weight: 500; height: 28px; min-height: 28px; }
+        .action-btn { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; font-size: 11px; border-radius: 6px; font-weight: 500; height: 28px; min-height: 28px; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 4px; cursor: pointer; }
         .action-btn:active { background: var(--accent-soft); }
         .action-btn.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
         .media-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin-top: 4px; }
@@ -536,9 +539,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .media-thumb img, .media-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
         .media-thumb .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.35); pointer-events: none; }
         .media-thumb .play-badge svg { width: 22px; height: 22px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
+        .live-badge { position: absolute; top: 5px; left: 5px; background: rgba(15,23,42,0.72); color: #fff; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 2px 6px 2px 5px; border-radius: 10px; display: inline-flex; align-items: center; gap: 3px; pointer-events: none; z-index: 2; }
+        .live-badge svg { width: 10px; height: 10px; color: var(--live); }
         .batch-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
         .batch-file-row { display: flex; align-items: center; gap: 10px; background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
-        .batch-file-thumb { width: 42px; height: 42px; border-radius: 6px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        .batch-file-thumb { position: relative; width: 42px; height: 42px; border-radius: 6px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
         .batch-file-thumb img, .batch-file-thumb video { width: 100%; height: 100%; object-fit: cover; }
         .batch-file-icon { width: 42px; height: 42px; border-radius: 6px; background: var(--border); color: var(--muted); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; }
         .batch-file-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
@@ -547,17 +552,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .audio-player-wrap { margin-top: 6px; width: 100%; }
         .audio-player-wrap audio { width: 100%; height: 36px; border-radius: 6px; }
         .batch-audio-row audio { width: 100%; max-width: 220px; height: 32px; }
-        .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; }
+        .gallery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; justify-content: flex-end; align-items: center; }
         .gallery-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+        .zip-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-right: auto; cursor: pointer; }
+        .zip-opt input { width: 14px; height: 14px; padding: 0; -webkit-appearance: checkbox; appearance: checkbox; accent-color: var(--text); }
+
+        .live-card { display: flex; flex-direction: column; gap: 8px; }
+        .live-stage { position: relative; background: #0f172a; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; min-height: 160px; max-height: 300px; cursor: pointer; }
+        .live-stage img, .live-stage video { max-width: 100%; max-height: 300px; object-fit: contain; display: block; }
+        .live-stage video { position: absolute; inset: 0; width: 100%; height: 100%; background: #0f172a; }
+        .live-stage .live-badge { top: 8px; left: 8px; }
+        .live-hint { position: absolute; bottom: 8px; left: 0; right: 0; text-align: center; font-size: 10px; color: rgba(255,255,255,0.78); pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
+        .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--card); }
+        .seg button { background: transparent; color: var(--muted); border: none; border-radius: 0; min-height: 28px; height: 28px; padding: 0 12px; font-size: 11px; font-weight: 600; }
+        .seg button.on { background: var(--accent); color: var(--bg); }
+        .live-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: space-between; }
+        .dl-menu { position: relative; display: inline-block; }
+        .dl-pop { display: none; position: absolute; right: 0; bottom: calc(100% + 6px); min-width: 190px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,0.22); padding: 4px; z-index: 40; flex-direction: column; }
+        .dl-pop.open { display: flex; }
+        .dl-pop button { background: transparent; color: var(--text); border: none; border-radius: 6px; justify-content: flex-start; min-height: 34px; padding: 6px 10px; font-size: 12px; width: 100%; text-align: left; }
+        .dl-pop button:active, .dl-pop button:hover { background: var(--accent-soft); }
+        .dl-pop small { display: block; font-size: 10px; color: var(--muted2); font-weight: 400; }
+
         .lightbox { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(15,23,42,0.94); flex-direction: column; align-items: center; justify-content: center; padding: 12px; padding-top: max(12px, env(safe-area-inset-top)); }
         .lightbox.open { display: flex; }
-        .lightbox-toolbar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; color: #e2e8f0; font-size: 13px; background: linear-gradient(to bottom, rgba(0,0,0,0.55), transparent); padding-top: max(12px, env(safe-area-inset-top)); }
+        .lightbox-toolbar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; color: #e2e8f0; font-size: 13px; background: linear-gradient(to bottom, rgba(0,0,0,0.55), transparent); padding-top: max(12px, env(safe-area-inset-top)); z-index: 3; gap: 8px; }
         .lightbox-close, .lightbox-nav { background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2); color: #fff; border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; min-height: 40px; }
-        .lightbox-stage { max-width: 96vw; max-height: 78vh; display: flex; align-items: center; justify-content: center; }
-        .lightbox-stage img, .lightbox-stage video { max-width: 96vw; max-height: 78vh; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
-        .lightbox-nav-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; pointer-events: none; padding: 0 8px; }
+        .lightbox-stage { position: relative; max-width: 96vw; max-height: 74vh; display: flex; align-items: center; justify-content: center; }
+        .lightbox-stage img, .lightbox-stage video { max-width: 96vw; max-height: 74vh; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+        .lightbox-nav-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: space-between; pointer-events: none; padding: 0 8px; z-index: 2; }
         .lightbox-nav-wrap button { pointer-events: auto; width: 44px; height: 44px; border-radius: 50%; display: flex; align-items: center; justify-content: center; padding: 0; }
         .lightbox-counter { font-variant-numeric: tabular-nums; }
+        .lightbox-bottom { position: absolute; bottom: 0; left: 0; right: 0; display: flex; justify-content: center; align-items: center; gap: 8px; padding: 12px 14px; padding-bottom: max(14px, env(safe-area-inset-bottom)); background: linear-gradient(to top, rgba(0,0,0,0.55), transparent); z-index: 3; flex-wrap: wrap; }
+        .lightbox-bottom .seg { border-color: rgba(255,255,255,0.25); background: rgba(255,255,255,0.08); }
+        .lightbox-bottom .seg button { color: #cbd5e1; }
+        .lightbox-bottom .seg button.on { background: #fff; color: #0f172a; }
+        .lightbox-name { color: #cbd5e1; font-size: 11px; max-width: 60vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .lb-live-hint { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; font-size: 11px; color: rgba(255,255,255,0.8); pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
+
         #log-container { font-family: ui-monospace, monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
         .log-entry { padding: 5px 7px; border-radius: 5px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.35; }
         .log-time { color: var(--muted2); flex-shrink: 0; }
@@ -692,7 +724,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
                     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                     <span>Tap or drag files / photos here</span>
-                    <span style="font-size:11px;color:var(--muted2);">Multi-select → gallery + ZIP download</span>
+                    <span style="font-size:11px;color:var(--muted2);">Live Photo: select both the HEIC and MOV files</span>
                     <input type="file" id="file-input" multiple accept="*/*" style="display:none;" onchange="handleFileSelect(event)">
                 </div>
                 <div id="progress-wrap" style="display:none;">
@@ -754,14 +786,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
         <div class="lightbox-nav-wrap">
-            <button class="lightbox-nav" onclick="lightboxNav(-1)" title="Previous">&#8249;</button>
-            <button class="lightbox-nav" onclick="lightboxNav(1)" title="Next">&#8250;</button>
+            <button class="lightbox-nav" onclick="lightboxNav(-1)" title="Previous" aria-label="Previous">&#8249;</button>
+            <button class="lightbox-nav" onclick="lightboxNav(1)" title="Next" aria-label="Next">&#8250;</button>
         </div>
         <div class="lightbox-stage" id="lightbox-stage"></div>
+        <div class="lightbox-bottom" id="lightbox-bottom"></div>
     </div>
     <div class="toast" id="toast"></div>
 <script>
-/* ========== PairMe client ========== */
+/* ========== PairMe client v2.2 ========== */
 var socket = null;
 var mySid = "";
 var myPeerId = "";
@@ -778,6 +811,7 @@ var batchStore = {};
 var mediaRegistry = {};
 var lightboxItems = [];
 var lightboxIndex = 0;
+var lightboxMode = {};
 var CHUNK_SIZE = 16384;
 var STUN_SERVERS = {
     iceServers: [
@@ -807,6 +841,7 @@ var peerConnState = {};
 var pendingShareOpen = false;
 var urlRoomCode = null;
 var toastTimer = null;
+var openDlPop = null;
 
 function switchTab(tab) {
     var cards = ["devices", "transfer", "logs"];
@@ -851,7 +886,7 @@ function escapeHtml(text) {
 }
 
 function formatBytes(bytes) {
-    if (bytes === 0) return "0 B";
+    if (!bytes) return "0 B";
     var k = 1024;
     var sizes = ["B", "KB", "MB", "GB"];
     var i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -2100,10 +2135,7 @@ function isHeicType(type, name) {
 }
 
 function isImageType(type) { return !!(type && type.indexOf("image/") === 0); }
-function isVideoType(type) {
-    if (type && type.indexOf("video/") === 0) return true;
-    return false;
-}
+function isVideoType(type) { return !!(type && type.indexOf("video/") === 0); }
 function isAudioType(type) { return !!(type && type.indexOf("audio/") === 0); }
 function isMediaType(type) { return isImageType(type) || isVideoType(type); }
 
@@ -2122,46 +2154,371 @@ function fileExtLabel(name, type) {
     return "FILE";
 }
 
+function baseName(name) {
+    var n = name || "file";
+    var dot = n.lastIndexOf(".");
+    return dot > 0 ? n.slice(0, dot) : n;
+}
+
+function swapExt(name, newExt) {
+    return baseName(name) + "." + newExt;
+}
+
+function isStillImage(item) {
+    return isImageType(item.type) || isHeicType(item.type, item.name);
+}
+
+function isMovItem(item) {
+    if (isVideoType(item.type)) {
+        var n = (item.name || "").toLowerCase();
+        return n.endsWith(".mov") || item.type === "video/quicktime";
+    }
+    return false;
+}
+
 function registerMedia(item) {
-    var id = "m_" + generateTransferId();
+    var id = "m_" + generateTransferId() + "_" + Math.floor(Math.random() * 1000);
     mediaRegistry[id] = item;
     return id;
+}
+
+/* ---------- HEIC: lazy conversion with cache ---------- */
+
+function ensureJpegPreview(item) {
+    if (item._jpegPromise) return item._jpegPromise;
+    if (!isHeicType(item.type, item.name)) {
+        item._jpegPromise = Promise.resolve(item.blob || null);
+        return item._jpegPromise;
+    }
+    if (typeof heic2any === "undefined") {
+        item._jpegPromise = Promise.reject(new Error("HEIC converter not loaded"));
+        return item._jpegPromise;
+    }
+    var start = item.blob ? Promise.resolve(item.blob) : fetch(item.url).then(function(r) { return r.blob(); });
+    item._jpegPromise = start.then(function(blob) {
+        return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 });
+    }).then(function(result) {
+        var jpegBlob = Array.isArray(result) ? result[0] : result;
+        item.jpegBlob = jpegBlob;
+        item.jpegUrl = URL.createObjectURL(jpegBlob);
+        item.previewUrl = item.jpegUrl;
+        item.convertedFromHeic = true;
+        return jpegBlob;
+    });
+    item._jpegPromise.catch(function(err) {
+        log("HEIC convert failed: " + (err && err.message ? err.message : err), "warn");
+    });
+    return item._jpegPromise;
 }
 
 function prepareItemPreview(item) {
     return new Promise(function(resolve) {
         normalizeItemMime(item);
         item.previewUrl = item.url;
-        item.previewReady = true;
-
         if (!isHeicType(item.type, item.name)) {
             resolve(item);
             return;
         }
-        if (typeof heic2any === "undefined") {
-            resolve(item);
-            return;
-        }
-
-        var sourceBlob = item.blob;
-        var start = sourceBlob
-            ? Promise.resolve(sourceBlob)
-            : fetch(item.url).then(function(r) { return r.blob(); });
-
-        start.then(function(blob) {
-            return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 });
-        }).then(function(result) {
-            var jpegBlob = Array.isArray(result) ? result[0] : result;
-            item.previewUrl = URL.createObjectURL(jpegBlob);
-            item.previewType = "image/jpeg";
-            item.convertedFromHeic = true;
-            resolve(item);
-        }).catch(function(err) {
-            log("HEIC preview convert failed: " + (err && err.message ? err.message : err), "warn");
-            resolve(item);
-        });
+        ensureJpegPreview(item).then(function() { resolve(item); }).catch(function() { resolve(item); });
     });
 }
+
+function previewSrc(item) {
+    return item.previewUrl || item.url;
+}
+
+/* ---------- Live Photo pairing ---------- */
+
+function buildUnits(items) {
+    var stills = {};
+    var movs = {};
+    var order = [];
+    var used = {};
+
+    items.forEach(function(it) {
+        var key = baseName(it.name).toLowerCase();
+        if (isStillImage(it)) {
+            if (!stills[key]) stills[key] = it;
+        } else if (isMovItem(it)) {
+            if (!movs[key]) movs[key] = it;
+        }
+    });
+
+    var units = [];
+    items.forEach(function(it) {
+        var key = baseName(it.name).toLowerCase();
+        if (used[it.name + "|" + it.size]) return;
+        if (isStillImage(it) && movs[key] && stills[key] === it) {
+            var mov = movs[key];
+            used[it.name + "|" + it.size] = true;
+            used[mov.name + "|" + mov.size] = true;
+            units.push({ kind: "live", still: it, mov: mov, key: key });
+        } else if (isMovItem(it) && stills[key] && movs[key] === it) {
+            var st = stills[key];
+            if (!used[st.name + "|" + st.size]) {
+                used[st.name + "|" + st.size] = true;
+                used[it.name + "|" + it.size] = true;
+                units.push({ kind: "live", still: st, mov: it, key: key });
+            }
+        }
+    });
+    items.forEach(function(it) {
+        if (used[it.name + "|" + it.size]) return;
+        used[it.name + "|" + it.size] = true;
+        units.push({ kind: "single", item: it });
+    });
+
+    var idxOf = function(u) {
+        if (u.kind === "live") return Math.min(u.still.batch_index || 0, u.mov.batch_index || 0);
+        return u.item.batch_index || 0;
+    };
+    units.sort(function(a, b) { return idxOf(a) - idxOf(b); });
+    return units;
+}
+
+/* ---------- Download helpers ---------- */
+
+function triggerDownload(url, name) {
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name || "file";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+function downloadOriginal(item) {
+    triggerDownload(item.url, item.name);
+}
+
+function downloadAsJpg(item) {
+    if (!isHeicType(item.type, item.name)) {
+        triggerDownload(item.url, item.name);
+        return;
+    }
+    showToast("Converting to JPG...");
+    ensureJpegPreview(item).then(function() {
+        triggerDownload(item.jpegUrl, swapExt(item.name, "jpg"));
+    }).catch(function() {
+        showToast("Could not convert. Downloading original.");
+        triggerDownload(item.url, item.name);
+    });
+}
+
+function downloadLiveMov(unit) {
+    triggerDownload(unit.mov.url, unit.mov.name);
+}
+
+function downloadLivePair(unit) {
+    triggerDownload(unit.still.url, unit.still.name);
+    setTimeout(function() { triggerDownload(unit.mov.url, unit.mov.name); }, 400);
+}
+
+function closeAllDlPops() {
+    var pops = document.querySelectorAll(".dl-pop.open");
+    for (var i = 0; i < pops.length; i++) pops[i].classList.remove("open");
+}
+
+function toggleDlPop(popId, ev) {
+    if (ev) ev.stopPropagation();
+    var el = document.getElementById(popId);
+    if (!el) return;
+    var wasOpen = el.classList.contains("open");
+    closeAllDlPops();
+    if (!wasOpen) el.classList.add("open");
+}
+
+document.addEventListener("click", function() { closeAllDlPops(); });
+
+function runDl(unitId, action) {
+    var u = unitRegistry[unitId];
+    if (!u) return;
+    closeAllDlPops();
+    if (u.kind === "live") {
+        if (action === "heic") downloadOriginal(u.still);
+        else if (action === "jpg") downloadAsJpg(u.still);
+        else if (action === "mov") downloadLiveMov(u);
+        else if (action === "pair") downloadLivePair(u);
+    } else {
+        if (action === "orig") downloadOriginal(u.item);
+        else if (action === "jpg") downloadAsJpg(u.item);
+    }
+}
+
+var unitRegistry = {};
+
+function registerUnit(u) {
+    var id = "u_" + generateTransferId() + "_" + Math.floor(Math.random() * 1000);
+    unitRegistry[id] = u;
+    return id;
+}
+
+function dlMenuHtml(unitId, u) {
+    var popId = "pop_" + unitId;
+    var items = "";
+    if (u.kind === "live") {
+        var stillIsHeic = isHeicType(u.still.type, u.still.name);
+        items += '<button onclick="runDl(\'' + unitId + '\',\'heic\')">' + (stillIsHeic ? "HEIC (original)" : "Photo (original)") + '<small>' + escapeHtml(u.still.name) + ' · ' + formatBytes(u.still.size) + '</small></button>';
+        if (stillIsHeic) items += '<button onclick="runDl(\'' + unitId + '\',\'jpg\')">JPG (converted)<small>Works everywhere</small></button>';
+        items += '<button onclick="runDl(\'' + unitId + '\',\'mov\')">MOV (Live video)<small>' + escapeHtml(u.mov.name) + ' · ' + formatBytes(u.mov.size) + '</small></button>';
+        items += '<button onclick="runDl(\'' + unitId + '\',\'pair\')">Both files<small>Original photo + MOV</small></button>';
+    } else if (isHeicType(u.item.type, u.item.name)) {
+        items += '<button onclick="runDl(\'' + unitId + '\',\'orig\')">HEIC (original)<small>' + formatBytes(u.item.size) + '</small></button>';
+        items += '<button onclick="runDl(\'' + unitId + '\',\'jpg\')">JPG (converted)<small>Works everywhere</small></button>';
+    } else {
+        return '<a href="' + u.item.url + '" download="' + escapeHtml(u.item.name) + '" class="action-btn">Download</a>';
+    }
+    return '<div class="dl-menu">' +
+        '<button class="action-btn primary" onclick="toggleDlPop(\'' + popId + '\', event)">Download &#9662;</button>' +
+        '<div class="dl-pop" id="' + popId + '" onclick="event.stopPropagation()">' + items + '</div>' +
+    '</div>';
+}
+
+/* ---------- Live Photo UI ---------- */
+
+var LIVE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="2.2" fill="currentColor"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="9.5" stroke-dasharray="2 2.6"/></svg>';
+
+function liveBadgeHtml() {
+    return '<span class="live-badge">' + LIVE_ICON + 'LIVE</span>';
+}
+
+function attachLiveStage(stageEl, unit, modeGetter) {
+    var video = null;
+    var pressTimer = null;
+
+    function ensureVideo() {
+        if (video) return video;
+        video = document.createElement("video");
+        video.src = unit.mov.url;
+        video.playsInline = true;
+        video.setAttribute("playsinline", "");
+        video.muted = false;
+        video.loop = false;
+        video.preload = "auto";
+        video.style.display = "none";
+        video.addEventListener("ended", function() { hideVideo(); });
+        stageEl.appendChild(video);
+        return video;
+    }
+    function showVideoAndPlay() {
+        var v = ensureVideo();
+        v.style.display = "block";
+        try { v.currentTime = 0; } catch (e) {}
+        var p = v.play();
+        if (p && p.catch) p.catch(function() {
+            v.muted = true;
+            v.play().catch(function() {});
+        });
+    }
+    function hideVideo() {
+        if (!video) return;
+        try { video.pause(); } catch (e) {}
+        video.style.display = "none";
+    }
+
+    var pressed = false;
+    function down(e) {
+        if (modeGetter() === "live") return;
+        pressed = true;
+        pressTimer = setTimeout(function() { if (pressed) showVideoAndPlay(); }, 220);
+    }
+    function up() {
+        pressed = false;
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+        if (modeGetter() !== "live") hideVideo();
+    }
+    stageEl.addEventListener("mousedown", down);
+    stageEl.addEventListener("touchstart", down, { passive: true });
+    stageEl.addEventListener("mouseup", up);
+    stageEl.addEventListener("mouseleave", up);
+    stageEl.addEventListener("touchend", up);
+    stageEl.addEventListener("touchcancel", up);
+
+    return {
+        setMode: function(mode) {
+            if (mode === "live") {
+                showVideoAndPlay();
+                video.controls = true;
+                video.loop = true;
+            } else {
+                if (video) { video.controls = false; video.loop = false; }
+                hideVideo();
+            }
+        },
+        destroy: function() {
+            if (video) { try { video.pause(); } catch (e) {} if (video.parentNode) video.parentNode.removeChild(video); video = null; }
+        }
+    };
+}
+
+function buildLiveCard(unit, container) {
+    var unitId = registerUnit(unit);
+    var mode = "photo";
+    var stillMediaId = registerMedia(unit.still);
+    var movMediaId = registerMedia(unit.mov);
+    unit.stillMediaId = stillMediaId;
+    unit.movMediaId = movMediaId;
+
+    var wrap = document.createElement("div");
+    wrap.className = "live-card";
+
+    var stage = document.createElement("div");
+    stage.className = "live-stage";
+    stage.innerHTML = '<img src="' + previewSrc(unit.still) + '" alt="' + escapeHtml(unit.still.name) + '">' +
+        liveBadgeHtml() +
+        '<div class="live-hint">Press and hold to play</div>';
+    wrap.appendChild(stage);
+
+    var ctl = attachLiveStage(stage, unit, function() { return mode; });
+
+    var toolbar = document.createElement("div");
+    toolbar.className = "live-toolbar";
+    var seg = document.createElement("div");
+    seg.className = "seg";
+    var bPhoto = document.createElement("button");
+    bPhoto.textContent = "Photo";
+    bPhoto.className = "on";
+    var bLive = document.createElement("button");
+    bLive.textContent = "Live";
+    seg.appendChild(bPhoto);
+    seg.appendChild(bLive);
+
+    function setMode(m) {
+        mode = m;
+        bPhoto.className = (m === "photo") ? "on" : "";
+        bLive.className = (m === "live") ? "on" : "";
+        var hint = stage.querySelector(".live-hint");
+        if (hint) hint.style.display = (m === "photo") ? "block" : "none";
+        ctl.setMode(m);
+    }
+    bPhoto.onclick = function() { setMode("photo"); };
+    bLive.onclick = function() { setMode("live"); };
+
+    var right = document.createElement("div");
+    right.style.cssText = "display:flex;gap:6px;align-items:center;";
+    var expand = document.createElement("button");
+    expand.className = "action-btn";
+    expand.textContent = "Open";
+    expand.onclick = function() { openLightbox([stillMediaId], 0); };
+    right.appendChild(expand);
+    var dlWrap = document.createElement("span");
+    dlWrap.innerHTML = dlMenuHtml(unitId, unit);
+    right.appendChild(dlWrap);
+
+    toolbar.appendChild(seg);
+    toolbar.appendChild(right);
+    wrap.appendChild(toolbar);
+
+    var meta = document.createElement("div");
+    meta.className = "gallery-meta";
+    meta.textContent = baseName(unit.still.name) + " · " + formatBytes(unit.still.size + unit.mov.size);
+    wrap.appendChild(meta);
+
+    container.appendChild(wrap);
+}
+
+/* ---------- Batch UI ---------- */
 
 function ensureBatchCard(batchId, sender, total) {
     if (batchStore[batchId] && batchStore[batchId].cardEl) return batchStore[batchId];
@@ -2182,6 +2539,7 @@ function ensureBatchCard(batchId, sender, total) {
         '<div class="gallery-meta" id="batch-meta-' + batchId + '">Receiving 0 / ' + total + '...</div>' +
         '<div id="batch-body-' + batchId + '"></div>' +
         '<div class="gallery-actions" id="batch-actions-' + batchId + '" style="display:none;">' +
+            '<label class="zip-opt" id="batch-zipopt-' + batchId + '" style="display:none;"><input type="checkbox" id="batch-keepheic-' + batchId + '" checked> Keep HEIC original</label>' +
             '<button class="action-btn" onclick="downloadBatchIndividual(\'' + batchId + '\')">Download all</button>' +
             '<button class="action-btn primary" onclick="downloadBatchZip(\'' + batchId + '\')">Download ZIP</button>' +
         '</div>';
@@ -2192,19 +2550,10 @@ function ensureBatchCard(batchId, sender, total) {
         total: total,
         cardEl: li,
         mediaIds: [],
-        mode: null
+        mode: null,
+        liveCtls: []
     };
     return batchStore[batchId];
-}
-
-function decideBatchMode(batch) {
-    if (!batch.items.length) return "list";
-    var allVisual = batch.items.every(function(it) { return isMediaType(it.type); });
-    return allVisual ? "gallery" : "list";
-}
-
-function previewSrc(item) {
-    return item.previewUrl || item.url;
 }
 
 function renderBatchBody(batchId) {
@@ -2212,60 +2561,82 @@ function renderBatchBody(batchId) {
     if (!batch) return;
     var body = document.getElementById("batch-body-" + batchId);
     if (!body) return;
-
-    var mode = decideBatchMode(batch);
-    batch.mode = mode;
     body.innerHTML = "";
+    batch.mediaIds = [];
 
-    if (mode === "gallery") {
+    var units = buildUnits(batch.items);
+    batch.units = units;
+    var hasLive = units.some(function(u) { return u.kind === "live"; });
+    var hasHeic = batch.items.some(function(it) { return isHeicType(it.type, it.name); });
+    var zipOpt = document.getElementById("batch-zipopt-" + batchId);
+    if (zipOpt) zipOpt.style.display = hasHeic ? "inline-flex" : "none";
+
+    var allVisual = units.every(function(u) {
+        return u.kind === "live" || isMediaType(u.item.type) || isHeicType(u.item.type, u.item.name);
+    });
+
+    if (allVisual) {
         var grid = document.createElement("div");
         grid.className = "media-gallery";
-        batch.mediaIds = [];
-        batch.items.forEach(function(item) {
-            var mediaId = registerMedia(item);
-            batch.mediaIds.push(mediaId);
+        var ids = [];
+        units.forEach(function(u) {
+            var it = (u.kind === "live") ? u.still : u.item;
+            var mediaId = registerMedia(it);
+            if (u.kind === "live") u.stillMediaId = mediaId;
+            ids.push(mediaId);
+        });
+        batch.mediaIds = ids;
+        units.forEach(function(u, idx) {
+            var it = (u.kind === "live") ? u.still : u.item;
             var thumb = document.createElement("div");
             thumb.className = "media-thumb";
-            (function(mid, ids) {
-                thumb.onclick = function() { openLightbox(ids, ids.indexOf(mid)); };
-            })(mediaId, batch.mediaIds);
-            if (isImageType(item.type) || item.convertedFromHeic) {
-                thumb.innerHTML = '<img src="' + previewSrc(item) + '" alt="' + escapeHtml(item.name) + '" loading="lazy">';
-            } else if (isVideoType(item.type)) {
-                thumb.innerHTML =
-                    '<video src="' + item.url + '" muted preload="metadata"></video>' +
-                    '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
+            (function(i) {
+                thumb.onclick = function() { openLightbox(ids, i, units); };
+            })(idx);
+            if (isStillImage(it)) {
+                thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="' + escapeHtml(it.name) + '" loading="lazy">';
             } else {
-                thumb.innerHTML = '<div class="batch-file-icon" style="width:100%;height:100%;border-radius:0;">' + fileExtLabel(item.name, item.type) + '</div>';
+                thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>' +
+                    '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
             }
+            if (u.kind === "live") thumb.insertAdjacentHTML("beforeend", liveBadgeHtml());
             grid.appendChild(thumb);
         });
         body.appendChild(grid);
     } else {
         var listEl = document.createElement("div");
         listEl.className = "batch-file-list";
-        batch.mediaIds = [];
-        batch.items.forEach(function(item) {
+        var listIds = [];
+        var listUnits = [];
+        units.forEach(function(u) {
+            var it = (u.kind === "live") ? u.still : u.item;
+            if (isMediaType(it.type) || isHeicType(it.type, it.name)) {
+                listIds.push(registerMedia(it));
+                listUnits.push(u);
+            }
+        });
+        batch.mediaIds = listIds;
+
+        units.forEach(function(u) {
+            var it = (u.kind === "live") ? u.still : u.item;
             var row = document.createElement("div");
             row.className = "batch-file-row";
+            var unitId = registerUnit(u);
 
-            if (isMediaType(item.type) || item.convertedFromHeic) {
-                var mediaId = registerMedia(item);
-                batch.mediaIds.push(mediaId);
+            if (isMediaType(it.type) || isHeicType(it.type, it.name)) {
+                var pos = listUnits.indexOf(u);
                 var thumb = document.createElement("div");
                 thumb.className = "batch-file-thumb";
-                (function(mid) {
-                    thumb.onclick = function() {
-                        openLightbox(batch.mediaIds.slice(), batch.mediaIds.indexOf(mid));
-                    };
-                })(mediaId);
-                if (isImageType(item.type) || item.convertedFromHeic) {
-                    thumb.innerHTML = '<img src="' + previewSrc(item) + '" alt="">';
+                (function(p) {
+                    thumb.onclick = function() { openLightbox(listIds, p, listUnits); };
+                })(pos);
+                if (isStillImage(it)) {
+                    thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="">';
                 } else {
-                    thumb.innerHTML = '<video src="' + item.url + '" muted preload="metadata"></video>';
+                    thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>';
                 }
                 row.appendChild(thumb);
-            } else if (isAudioType(item.type)) {
+            } else if (isAudioType(it.type)) {
                 var icon = document.createElement("div");
                 icon.className = "batch-file-icon";
                 icon.textContent = "AUD";
@@ -2273,33 +2644,35 @@ function renderBatchBody(batchId) {
             } else {
                 var icon2 = document.createElement("div");
                 icon2.className = "batch-file-icon";
-                icon2.textContent = fileExtLabel(item.name, item.type);
+                icon2.textContent = fileExtLabel(it.name, it.type);
                 row.appendChild(icon2);
             }
 
             var meta = document.createElement("div");
             meta.className = "batch-file-meta";
-            var nameLine = escapeHtml(item.name);
-            if (item.convertedFromHeic) nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC still)</span>';
+            var nameLine = escapeHtml(it.name);
+            var sizeLine = formatBytes(it.size);
+            if (u.kind === "live") {
+                nameLine += ' <span style="color:var(--live);font-weight:700;font-size:10px;">LIVE</span>';
+                sizeLine = formatBytes(u.still.size + u.mov.size) + " (photo + video)";
+            } else if (it.convertedFromHeic) {
+                nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC)</span>';
+            }
             meta.innerHTML =
-                '<span class="batch-file-name" title="' + escapeHtml(item.name) + '">' + nameLine + '</span>' +
-                '<span class="batch-file-size">' + formatBytes(item.size) + '</span>';
+                '<span class="batch-file-name" title="' + escapeHtml(it.name) + '">' + nameLine + '</span>' +
+                '<span class="batch-file-size">' + sizeLine + '</span>';
             row.appendChild(meta);
 
-            if (isAudioType(item.type)) {
+            if (isAudioType(it.type)) {
                 var audioWrap = document.createElement("div");
                 audioWrap.className = "batch-audio-row";
-                audioWrap.innerHTML = '<audio controls preload="metadata" src="' + item.url + '"></audio>';
+                audioWrap.innerHTML = '<audio controls preload="metadata" src="' + it.url + '"></audio>';
                 row.appendChild(audioWrap);
             }
 
-            var dl = document.createElement("a");
-            dl.href = item.url;
-            dl.download = item.name || "file";
-            dl.className = "action-btn";
-            dl.style.textDecoration = "none";
-            dl.textContent = "Download";
-            row.appendChild(dl);
+            var dlHolder = document.createElement("span");
+            dlHolder.innerHTML = dlMenuHtml(unitId, u);
+            row.appendChild(dlHolder);
             listEl.appendChild(row);
         });
         body.appendChild(listEl);
@@ -2316,8 +2689,12 @@ function addToBatch(batchId, item, sender) {
         var done = batch.items.length;
 
         if (done >= total) {
-            metaEl.textContent = done + " file" + (done > 1 ? "s" : "") + " · " +
+            var units = buildUnits(batch.items);
+            var liveCount = units.filter(function(u) { return u.kind === "live"; }).length;
+            var label = done + " file" + (done > 1 ? "s" : "") + " · " +
                 formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+            if (liveCount) label += " · " + liveCount + " Live Photo" + (liveCount > 1 ? "s" : "");
+            metaEl.textContent = label;
             renderBatchBody(batchId);
             document.getElementById("batch-actions-" + batchId).style.display = "flex";
         } else {
@@ -2372,12 +2749,24 @@ function addReceived(type, data, sender) {
     prepareItemPreview(data).then(function(item) {
         var li = document.createElement("li");
         li.className = "feed-item";
+
+        var header =
+            '<div class="feed-header">' +
+                '<div class="feed-author">' +
+                    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                    '<span>' + escapeHtml(sender) + '</span>' +
+                '</div>' +
+                '<span class="feed-time">' + time + '</span>' +
+            '</div>';
+
+        var unit = { kind: "single", item: item };
+        var unitId = registerUnit(unit);
         var mediaId = registerMedia(item);
         var titleExtra = item.convertedFromHeic
-            ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC still · gửi thêm .MOV nếu là Live Photo)</span>'
+            ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC)</span>'
             : '';
         var previewHtml = "";
-        if (isImageType(item.type) || item.convertedFromHeic) {
+        if (isStillImage(item)) {
             previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
         } else if (isVideoType(item.type)) {
             previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + item.url + '" class="preview-img" muted playsinline></video></div>';
@@ -2385,56 +2774,114 @@ function addReceived(type, data, sender) {
             previewHtml = '<div class="audio-player-wrap"><audio controls preload="metadata" src="' + item.url + '"></audio></div>';
         }
 
-        li.innerHTML =
-            '<div class="feed-header">' +
-                '<div class="feed-author">' +
-                    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-                    '<span>' + escapeHtml(sender) + '</span>' +
-                '</div>' +
-                '<span class="feed-time">' + time + '</span>' +
-            '</div>' +
+        li.innerHTML = header +
             '<div class="file-card">' +
                 '<div class="file-meta">' +
                     '<span class="file-title" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + titleExtra + '</span>' +
                     '<span class="file-size">' + formatBytes(item.size) + '</span>' +
                 '</div>' +
-                '<a href="' + item.url + '" download="' + escapeHtml(item.name) + '" class="action-btn" style="text-decoration:none;display:inline-flex;align-items:center;gap:4px;">' +
-                    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
-                    'Download' +
-                '</a>' +
+                '<span class="dl-slot">' + dlMenuHtml(unitId, unit) + '</span>' +
             '</div>' + previewHtml;
         list.insertBefore(li, list.firstChild);
     });
 }
 
-function openLightbox(mediaIds, startIndex) {
+/* ---------- Lightbox ---------- */
+
+var lightboxUnits = null;
+
+function openLightbox(mediaIds, startIndex, units) {
     lightboxItems = mediaIds.slice();
+    lightboxUnits = units || null;
     lightboxIndex = Math.max(0, Math.min(startIndex || 0, lightboxItems.length - 1));
+    lightboxMode = {};
     renderLightbox();
     document.getElementById("lightbox").classList.add("open");
     document.body.style.overflow = "hidden";
 }
 
 function closeLightbox() {
+    stopLightboxLive();
     document.getElementById("lightbox").classList.remove("open");
     document.getElementById("lightbox-stage").innerHTML = "";
+    document.getElementById("lightbox-bottom").innerHTML = "";
     document.body.style.overflow = "";
     lightboxItems = [];
+    lightboxUnits = null;
 }
 
 function lightboxNav(delta) {
     if (!lightboxItems.length) return;
+    stopLightboxLive();
     lightboxIndex = (lightboxIndex + delta + lightboxItems.length) % lightboxItems.length;
     renderLightbox();
 }
 
-function renderLightbox() {
+var lbLiveCtl = null;
+
+function stopLightboxLive() {
+    if (lbLiveCtl) { lbLiveCtl.destroy(); lbLiveCtl = null; }
+}
+
+function currentLightboxUnit() {
+    if (lightboxUnits && lightboxUnits[lightboxIndex]) return lightboxUnits[lightboxIndex];
     var id = lightboxItems[lightboxIndex];
     var item = mediaRegistry[id];
-    if (!item) return;
+    return item ? { kind: "single", item: item } : null;
+}
+
+function renderLightbox() {
+    stopLightboxLive();
+    var unit = currentLightboxUnit();
+    if (!unit) return;
+    var item = (unit.kind === "live") ? unit.still : unit.item;
     document.getElementById("lightbox-counter").textContent = (lightboxIndex + 1) + " / " + lightboxItems.length;
     var stage = document.getElementById("lightbox-stage");
+    var bottom = document.getElementById("lightbox-bottom");
     stage.innerHTML = "";
+    bottom.innerHTML = "";
+
+    if (unit.kind === "live") {
+        var mode = lightboxMode[lightboxIndex] || "photo";
+        var img = document.createElement("img");
+        img.src = previewSrc(unit.still);
+        img.alt = unit.still.name || "";
+        stage.appendChild(img);
+        stage.insertAdjacentHTML("beforeend", liveBadgeHtml());
+        var hint = document.createElement("div");
+        hint.className = "lb-live-hint";
+        hint.textContent = "Press and hold the photo to play Live";
+        stage.appendChild(hint);
+
+        lbLiveCtl = attachLiveStage(stage, unit, function() { return lightboxMode[lightboxIndex] || "photo"; });
+
+        var seg = document.createElement("div");
+        seg.className = "seg";
+        var bPhoto = document.createElement("button");
+        bPhoto.textContent = "Photo";
+        var bLive = document.createElement("button");
+        bLive.textContent = "Live";
+        seg.appendChild(bPhoto);
+        seg.appendChild(bLive);
+        function apply(m) {
+            lightboxMode[lightboxIndex] = m;
+            bPhoto.className = (m === "photo") ? "on" : "";
+            bLive.className = (m === "live") ? "on" : "";
+            hint.style.display = (m === "photo") ? "block" : "none";
+            lbLiveCtl.setMode(m);
+        }
+        bPhoto.onclick = function() { apply("photo"); };
+        bLive.onclick = function() { apply("live"); };
+        bottom.appendChild(seg);
+        apply(mode);
+
+        var nm = document.createElement("span");
+        nm.className = "lightbox-name";
+        nm.textContent = unit.still.name + " + " + unit.mov.name;
+        bottom.appendChild(nm);
+        return;
+    }
+
     if (isVideoType(item.type)) {
         var v = document.createElement("video");
         v.src = item.url;
@@ -2450,37 +2897,80 @@ function renderLightbox() {
         a.style.width = "min(90vw, 420px)";
         stage.appendChild(a);
     } else {
-        var img = document.createElement("img");
-        img.src = previewSrc(item);
-        img.alt = item.name || "";
-        stage.appendChild(img);
+        var img2 = document.createElement("img");
+        img2.src = previewSrc(item);
+        img2.alt = item.name || "";
+        stage.appendChild(img2);
     }
+
+    if (isHeicType(item.type, item.name)) {
+        var seg2 = document.createElement("div");
+        seg2.className = "seg";
+        var showJpg = document.createElement("button");
+        showJpg.textContent = "Preview (JPG)";
+        showJpg.className = "on";
+        var showRaw = document.createElement("button");
+        showRaw.textContent = "Original HEIC";
+        seg2.appendChild(showJpg);
+        seg2.appendChild(showRaw);
+        showRaw.onclick = function() {
+            showToast("HEIC original cannot render in this browser. Use Download.");
+        };
+        bottom.appendChild(seg2);
+    }
+    var nm2 = document.createElement("span");
+    nm2.className = "lightbox-name";
+    nm2.textContent = item.name;
+    bottom.appendChild(nm2);
 }
 
 function downloadLightboxItem() {
-    var id = lightboxItems[lightboxIndex];
-    var item = mediaRegistry[id];
-    if (!item) return;
-    triggerDownload(item.url, item.name);
+    var unit = currentLightboxUnit();
+    if (!unit) return;
+    if (unit.kind === "live") {
+        downloadLivePair(unit);
+    } else {
+        downloadOriginal(unit.item);
+    }
 }
 
-function triggerDownload(url, name) {
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = name || "file";
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+/* ---------- Batch download ---------- */
+
+function batchFilesForZip(batch, keepHeic) {
+    var tasks = [];
+    batch.items.forEach(function(item) {
+        if (isHeicType(item.type, item.name) && !keepHeic) {
+            tasks.push(ensureJpegPreview(item).then(function(jpg) {
+                return { name: swapExt(item.name, "jpg"), blob: jpg };
+            }).catch(function() {
+                return { name: item.name, blob: item.blob || null, url: item.url };
+            }));
+        } else {
+            tasks.push(Promise.resolve({ name: item.name, blob: item.blob || null, url: item.url }));
+        }
+    });
+    return Promise.all(tasks);
 }
 
 function downloadBatchIndividual(batchId) {
     var batch = batchStore[batchId];
     if (!batch) return;
-    batch.items.forEach(function(item, i) {
-        setTimeout(function() { triggerDownload(item.url, item.name); }, i * 350);
+    var keepEl = document.getElementById("batch-keepheic-" + batchId);
+    var keep = keepEl ? keepEl.checked : true;
+    batchFilesForZip(batch, keep).then(function(files) {
+        files.forEach(function(f, i) {
+            setTimeout(function() {
+                if (f.blob && f.name !== undefined && (!f.url || f.blob !== undefined)) {
+                    var u = URL.createObjectURL(f.blob);
+                    triggerDownload(u, f.name);
+                    setTimeout(function() { URL.revokeObjectURL(u); }, 8000);
+                } else {
+                    triggerDownload(f.url, f.name);
+                }
+            }, i * 350);
+        });
+        log("Downloading " + files.length + " files individually", "info");
     });
-    log("Downloading " + batch.items.length + " files individually", "info");
 }
 
 function downloadBatchZip(batchId) {
@@ -2490,15 +2980,20 @@ function downloadBatchZip(batchId) {
         downloadBatchIndividual(batchId);
         return;
     }
+    var keepEl = document.getElementById("batch-keepheic-" + batchId);
+    var keep = keepEl ? keepEl.checked : true;
     var btn = document.querySelector('#batch-actions-' + batchId + ' .primary');
     if (btn) { btn.textContent = "Zipping..."; btn.disabled = true; }
     var zip = new JSZip();
     var folder = zip.folder("pairme_" + batchId.slice(-6));
-    var promises = batch.items.map(function(item) {
-        if (item.blob) return Promise.resolve(item.blob).then(function(b) { folder.file(item.name || "file", b); });
-        return fetch(item.url).then(function(r) { return r.blob(); }).then(function(b) { folder.file(item.name || "file", b); });
-    });
-    Promise.all(promises).then(function() {
+
+    batchFilesForZip(batch, keep).then(function(files) {
+        var adds = files.map(function(f) {
+            if (f.blob) { folder.file(f.name || "file", f.blob); return Promise.resolve(); }
+            return fetch(f.url).then(function(r) { return r.blob(); }).then(function(b) { folder.file(f.name || "file", b); });
+        });
+        return Promise.all(adds);
+    }).then(function() {
         return zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
     }).then(function(content) {
         var url = URL.createObjectURL(content);
