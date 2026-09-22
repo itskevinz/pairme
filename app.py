@@ -17,7 +17,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
@@ -431,6 +431,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/libheif-js@1.18.2/libheif-wasm/libheif-bundle.js"></script>
     <style>
         :root {
             --bg: #f8fafc;
@@ -541,6 +542,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .media-thumb .play-badge svg { width: 22px; height: 22px; color: #fff; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.4)); }
         .live-badge { position: absolute; top: 5px; left: 5px; background: rgba(15,23,42,0.72); color: #fff; font-size: 9px; font-weight: 800; letter-spacing: 0.6px; padding: 2px 6px 2px 5px; border-radius: 10px; display: inline-flex; align-items: center; gap: 3px; pointer-events: none; z-index: 2; }
         .live-badge svg { width: 10px; height: 10px; color: var(--live); }
+        .heic-fallback { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 100%; background: var(--accent-soft); color: var(--muted); }
+        .heic-fallback .heic-chip { background: var(--border); color: var(--text); font-size: 11px; font-weight: 800; letter-spacing: 0.5px; padding: 3px 9px; border-radius: 6px; }
+        .heic-fallback .heic-sub { font-size: 10px; color: var(--muted2); text-align: center; padding: 0 8px; line-height: 1.3; }
+        .file-preview.heic-fallback-wrap { background: var(--accent-soft); }
         .batch-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
         .batch-file-row { display: flex; align-items: center; gap: 10px; background: var(--accent-soft); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
         .batch-file-thumb { position: relative; width: 42px; height: 42px; border-radius: 6px; overflow: hidden; background: #0f172a; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; }
@@ -589,6 +594,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .lightbox-bottom .seg button.on { background: #fff; color: #0f172a; }
         .lightbox-name { color: #cbd5e1; font-size: 11px; max-width: 60vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .lb-live-hint { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; font-size: 11px; color: rgba(255,255,255,0.8); pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
+        .lb-heic-fallback { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: #cbd5e1; padding: 40px; text-align: center; }
+        .lb-heic-fallback .heic-chip { background: rgba(255,255,255,0.14); color: #fff; font-size: 12px; font-weight: 800; letter-spacing: 0.5px; padding: 4px 12px; border-radius: 8px; }
+        .lb-heic-fallback .heic-sub { font-size: 12px; color: #94a3b8; max-width: 280px; line-height: 1.5; }
 
         #log-container { font-family: ui-monospace, monospace; font-size: 11px; flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
         .log-entry { padding: 5px 7px; border-radius: 5px; display: flex; gap: 6px; align-items: flex-start; line-height: 1.35; }
@@ -794,7 +802,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="toast" id="toast"></div>
 <script>
-/* ========== PairMe client v2.2 ========== */
+/* ========== PairMe client v2.3 ========== */
 var socket = null;
 var mySid = "";
 var myPeerId = "";
@@ -2182,7 +2190,56 @@ function registerMedia(item) {
     return id;
 }
 
-/* ---------- HEIC: lazy conversion with cache ---------- */
+/* ---------- HEIC: two-tier lazy conversion with cache ---------- */
+
+var libheifInstance = null;
+function getLibheif() {
+    if (libheifInstance) return libheifInstance;
+    if (typeof libheif === "undefined") return null;
+    try {
+        libheifInstance = libheif();
+    } catch (e) {
+        libheifInstance = null;
+    }
+    return libheifInstance;
+}
+
+// Low-level fallback: decode with libheif-js directly, draw to canvas, export JPEG.
+// Catches HDR / 10-bit HEIC variants that heic2any's bundled libheif can't parse
+// (e.g. ERR_LIBHEIF format not supported from newer iPhone camera output).
+function convertHeicViaLibheifJs(blob) {
+    return new Promise(function(resolve, reject) {
+        var lh = getLibheif();
+        if (!lh) { reject(new Error("libheif-js not available")); return; }
+        blob.arrayBuffer().then(function(buf) {
+            var decoder = new lh.HeifDecoder();
+            var data;
+            try {
+                data = decoder.decode(new Uint8Array(buf));
+            } catch (e) {
+                reject(e);
+                return;
+            }
+            if (!data || !data.length) { reject(new Error("No image data decoded")); return; }
+            var image = data[0];
+            var w = image.get_width();
+            var h = image.get_height();
+            var canvas = document.createElement("canvas");
+            canvas.width = w;
+            canvas.height = h;
+            var ctx = canvas.getContext("2d");
+            var imgData = ctx.createImageData(w, h);
+            image.display(imgData, function(displayData) {
+                if (!displayData) { reject(new Error("libheif display() failed")); return; }
+                ctx.putImageData(displayData, 0, 0);
+                canvas.toBlob(function(jpegBlob) {
+                    if (jpegBlob) resolve(jpegBlob);
+                    else reject(new Error("canvas.toBlob returned null"));
+                }, "image/jpeg", 0.92);
+            });
+        }).catch(reject);
+    });
+}
 
 function ensureJpegPreview(item) {
     if (item._jpegPromise) return item._jpegPromise;
@@ -2190,23 +2247,40 @@ function ensureJpegPreview(item) {
         item._jpegPromise = Promise.resolve(item.blob || null);
         return item._jpegPromise;
     }
-    if (typeof heic2any === "undefined") {
-        item._jpegPromise = Promise.reject(new Error("HEIC converter not loaded"));
-        return item._jpegPromise;
-    }
+
     var start = item.blob ? Promise.resolve(item.blob) : fetch(item.url).then(function(r) { return r.blob(); });
+
+    function tryHeic2any(blob) {
+        if (typeof heic2any === "undefined") return Promise.reject(new Error("heic2any not loaded"));
+        return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 }).then(function(result) {
+            return Array.isArray(result) ? result[0] : result;
+        });
+    }
+
+    function tryLibheifJs(blob) {
+        return convertHeicViaLibheifJs(blob);
+    }
+
     item._jpegPromise = start.then(function(blob) {
-        return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 });
-    }).then(function(result) {
-        var jpegBlob = Array.isArray(result) ? result[0] : result;
+        return tryHeic2any(blob).catch(function(err1) {
+            log("HEIC convert (heic2any) failed, trying fallback decoder: " + (err1 && err1.message ? err1.message : err1), "warn");
+            return tryLibheifJs(blob).catch(function(err2) {
+                log("HEIC convert (fallback) failed: " + (err2 && err2.message ? err2.message : err2), "warn");
+                item.previewFailed = true;
+                throw err2;
+            });
+        });
+    }).then(function(jpegBlob) {
         item.jpegBlob = jpegBlob;
         item.jpegUrl = URL.createObjectURL(jpegBlob);
         item.previewUrl = item.jpegUrl;
         item.convertedFromHeic = true;
+        item.previewFailed = false;
         return jpegBlob;
     });
-    item._jpegPromise.catch(function(err) {
-        log("HEIC convert failed: " + (err && err.message ? err.message : err), "warn");
+
+    item._jpegPromise.catch(function() {
+        // already logged above; swallow so .catch() callers don't see unhandled rejection noise
     });
     return item._jpegPromise;
 }
@@ -2219,7 +2293,12 @@ function prepareItemPreview(item) {
             resolve(item);
             return;
         }
-        ensureJpegPreview(item).then(function() { resolve(item); }).catch(function() { resolve(item); });
+        ensureJpegPreview(item).then(function() {
+            resolve(item);
+        }).catch(function() {
+            item.previewFailed = true;
+            resolve(item);
+        });
     });
 }
 
@@ -2227,12 +2306,24 @@ function previewSrc(item) {
     return item.previewUrl || item.url;
 }
 
+// HTML for a thumbnail-sized "no preview" placeholder (grid / batch rows).
+function heicFallbackThumbHtml() {
+    return '<div class="heic-fallback"><span class="heic-chip">HEIC</span></div>';
+}
+
+// HTML for a larger "no preview" placeholder (single-file card / feed).
+function heicFallbackCardHtml() {
+    return '<div class="heic-fallback">' +
+        '<span class="heic-chip">HEIC</span>' +
+        '<span class="heic-sub">Preview not supported in this browser.<br>Original file is intact, download to view.</span>' +
+    '</div>';
+}
+
 /* ---------- Live Photo pairing ---------- */
 
 function buildUnits(items) {
     var stills = {};
     var movs = {};
-    var order = [];
     var used = {};
 
     items.forEach(function(it) {
@@ -2301,7 +2392,7 @@ function downloadAsJpg(item) {
     ensureJpegPreview(item).then(function() {
         triggerDownload(item.jpegUrl, swapExt(item.name, "jpg"));
     }).catch(function() {
-        showToast("Could not convert. Downloading original.");
+        showToast("Could not convert. Downloading original HEIC instead.");
         triggerDownload(item.url, item.name);
     });
 }
@@ -2465,9 +2556,13 @@ function buildLiveCard(unit, container) {
 
     var stage = document.createElement("div");
     stage.className = "live-stage";
-    stage.innerHTML = '<img src="' + previewSrc(unit.still) + '" alt="' + escapeHtml(unit.still.name) + '">' +
-        liveBadgeHtml() +
-        '<div class="live-hint">Press and hold to play</div>';
+    if (unit.still.previewFailed) {
+        stage.innerHTML = heicFallbackCardHtml() + liveBadgeHtml();
+    } else {
+        stage.innerHTML = '<img src="' + previewSrc(unit.still) + '" alt="' + escapeHtml(unit.still.name) + '">' +
+            liveBadgeHtml() +
+            '<div class="live-hint">Press and hold to play</div>';
+    }
     wrap.appendChild(stage);
 
     var ctl = attachLiveStage(stage, unit, function() { return mode; });
@@ -2566,7 +2661,6 @@ function renderBatchBody(batchId) {
 
     var units = buildUnits(batch.items);
     batch.units = units;
-    var hasLive = units.some(function(u) { return u.kind === "live"; });
     var hasHeic = batch.items.some(function(it) { return isHeicType(it.type, it.name); });
     var zipOpt = document.getElementById("batch-zipopt-" + batchId);
     if (zipOpt) zipOpt.style.display = hasHeic ? "inline-flex" : "none";
@@ -2594,7 +2688,11 @@ function renderBatchBody(batchId) {
                 thumb.onclick = function() { openLightbox(ids, i, units); };
             })(idx);
             if (isStillImage(it)) {
-                thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="' + escapeHtml(it.name) + '" loading="lazy">';
+                if (it.previewFailed) {
+                    thumb.innerHTML = heicFallbackThumbHtml();
+                } else {
+                    thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="' + escapeHtml(it.name) + '" loading="lazy">';
+                }
             } else {
                 thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>' +
                     '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
@@ -2631,7 +2729,11 @@ function renderBatchBody(batchId) {
                     thumb.onclick = function() { openLightbox(listIds, p, listUnits); };
                 })(pos);
                 if (isStillImage(it)) {
-                    thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="">';
+                    if (it.previewFailed) {
+                        thumb.innerHTML = heicFallbackThumbHtml();
+                    } else {
+                        thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="">';
+                    }
                 } else {
                     thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>';
                 }
@@ -2657,6 +2759,8 @@ function renderBatchBody(batchId) {
                 sizeLine = formatBytes(u.still.size + u.mov.size) + " (photo + video)";
             } else if (it.convertedFromHeic) {
                 nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC)</span>';
+            } else if (it.previewFailed) {
+                nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC, no preview)</span>';
             }
             meta.innerHTML =
                 '<span class="batch-file-name" title="' + escapeHtml(it.name) + '">' + nameLine + '</span>' +
@@ -2762,12 +2866,17 @@ function addReceived(type, data, sender) {
         var unit = { kind: "single", item: item };
         var unitId = registerUnit(unit);
         var mediaId = registerMedia(item);
-        var titleExtra = item.convertedFromHeic
-            ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC)</span>'
-            : '';
+        var titleExtra = "";
+        if (item.convertedFromHeic) titleExtra = ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC)</span>';
+        else if (item.previewFailed) titleExtra = ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC, no preview)</span>';
+
         var previewHtml = "";
         if (isStillImage(item)) {
-            previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
+            if (item.previewFailed) {
+                previewHtml = '<div class="file-preview heic-fallback-wrap">' + heicFallbackCardHtml() + '</div>';
+            } else {
+                previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
+            }
         } else if (isVideoType(item.type)) {
             previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + item.url + '" class="preview-img" muted playsinline></video></div>';
         } else if (isAudioType(item.type)) {
@@ -2843,17 +2952,25 @@ function renderLightbox() {
 
     if (unit.kind === "live") {
         var mode = lightboxMode[lightboxIndex] || "photo";
-        var img = document.createElement("img");
-        img.src = previewSrc(unit.still);
-        img.alt = unit.still.name || "";
-        stage.appendChild(img);
-        stage.insertAdjacentHTML("beforeend", liveBadgeHtml());
-        var hint = document.createElement("div");
-        hint.className = "lb-live-hint";
-        hint.textContent = "Press and hold the photo to play Live";
-        stage.appendChild(hint);
 
-        lbLiveCtl = attachLiveStage(stage, unit, function() { return lightboxMode[lightboxIndex] || "photo"; });
+        if (unit.still.previewFailed) {
+            stage.innerHTML = '<div class="lb-heic-fallback">' +
+                '<span class="heic-chip">HEIC</span>' +
+                '<span class="heic-sub">Photo preview not supported in this browser. Use Download to save the original HEIC + MOV pair.</span>' +
+            '</div>';
+        } else {
+            var img = document.createElement("img");
+            img.src = previewSrc(unit.still);
+            img.alt = unit.still.name || "";
+            stage.appendChild(img);
+            stage.insertAdjacentHTML("beforeend", liveBadgeHtml());
+            var hint = document.createElement("div");
+            hint.className = "lb-live-hint";
+            hint.textContent = "Press and hold the photo to play Live";
+            stage.appendChild(hint);
+
+            lbLiveCtl = attachLiveStage(stage, unit, function() { return lightboxMode[lightboxIndex] || "photo"; });
+        }
 
         var seg = document.createElement("div");
         seg.className = "seg";
@@ -2867,8 +2984,9 @@ function renderLightbox() {
             lightboxMode[lightboxIndex] = m;
             bPhoto.className = (m === "photo") ? "on" : "";
             bLive.className = (m === "live") ? "on" : "";
-            hint.style.display = (m === "photo") ? "block" : "none";
-            lbLiveCtl.setMode(m);
+            var hintEl = stage.querySelector(".lb-live-hint");
+            if (hintEl) hintEl.style.display = (m === "photo") ? "block" : "none";
+            if (lbLiveCtl) lbLiveCtl.setMode(m);
         }
         bPhoto.onclick = function() { apply("photo"); };
         bLive.onclick = function() { apply("live"); };
@@ -2896,6 +3014,11 @@ function renderLightbox() {
         a.autoplay = true;
         a.style.width = "min(90vw, 420px)";
         stage.appendChild(a);
+    } else if (item.previewFailed) {
+        stage.innerHTML = '<div class="lb-heic-fallback">' +
+            '<span class="heic-chip">HEIC</span>' +
+            '<span class="heic-sub">Preview not supported in this browser. The original file is intact, use Download to save it.</span>' +
+        '</div>';
     } else {
         var img2 = document.createElement("img");
         img2.src = previewSrc(item);
@@ -2903,7 +3026,7 @@ function renderLightbox() {
         stage.appendChild(img2);
     }
 
-    if (isHeicType(item.type, item.name)) {
+    if (isHeicType(item.type, item.name) && !item.previewFailed) {
         var seg2 = document.createElement("div");
         seg2.className = "seg";
         var showJpg = document.createElement("button");
@@ -2960,7 +3083,7 @@ function downloadBatchIndividual(batchId) {
     batchFilesForZip(batch, keep).then(function(files) {
         files.forEach(function(f, i) {
             setTimeout(function() {
-                if (f.blob && f.name !== undefined && (!f.url || f.blob !== undefined)) {
+                if (f.blob) {
                     var u = URL.createObjectURL(f.blob);
                     triggerDownload(u, f.name);
                     setTimeout(function() { URL.revokeObjectURL(u); }, 8000);
