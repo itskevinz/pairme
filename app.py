@@ -1,218 +1,426 @@
 from gevent import monkey
 monkey.patch_all()
 
+import base64
+import logging
 import os
 import re
+import secrets
 import time
 import uuid
-import random
-import logging
-import hashlib
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import wraps
 
 from flask import Flask, render_template_string, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+APP_VERSION = "3.1.0"
+
+MAX_HTTP_BUFFER = 50 * 1024 * 1024
+MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
+MAX_CHUNK_BYTES = 256 * 1024
+
+STALE_TTL = 90
+CLEANUP_INTERVAL = 30
+
+MAX_TEXT_LEN = 20_000
+MAX_NAME_LEN = 32
+MAX_FILE_NAME_LEN = 255
+MAX_FILE_TYPE_LEN = 127
+MAX_TRANSFER_ID_LEN = 64
+MAX_BATCH_ID_LEN = 64
+
+RATE_LIMIT_WINDOW = 5.0
+RATE_LIMIT_MAX_EVENTS = 80
+FILECHUNK_RATE_BYTES = 128 * 1024 * 1024
+
+ROOM_CODE_RE = re.compile(r"^\d{6}$")
+NAME_RE = re.compile(r"^[\w .\-]{1,32}$", re.UNICODE)
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+PEER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,32}$")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.3.0"
-
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
+app.config["SECRET_KEY"] = (
+    os.environ.get("SECRET_KEY")
+    or secrets.token_hex(32)
+)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
-cors_origins = ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*"
+allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+cors_origins = (
+    [x.strip() for x in allowed_origins.split(",") if x.strip()]
+    if allowed_origins != "*"
+    else "*"
+)
 
 socketio = SocketIO(
     app,
     cors_allowed_origins=cors_origins,
     async_mode="gevent",
-    ping_timeout=60,
-    ping_interval=25,
-    max_http_buffer_size=50 * 1024 * 1024,
+    ping_timeout=45,
+    ping_interval=20,
+    max_http_buffer_size=MAX_HTTP_BUFFER,
     engineio_logger=False,
     logger=False,
 )
 
 peers = {}
 rooms_index = defaultdict(set)
-fp_to_peer_id = {}
+device_to_peer_id = {}
 peer_id_to_sid = {}
 peer_last_room = {}
 peer_last_name = {}
-rate_buckets = defaultdict(list)
 
-STALE_TTL = 90
-CLEANUP_INTERVAL = 30
+rate_buckets = defaultdict(deque)
+rate_totals = defaultdict(int)
 
-NAME_RE = re.compile(r"^[\w \-.]{1,32}$", re.UNICODE)
-ROOM_CODE_RE = re.compile(r"^\d{6}$")
-MAX_TEXT_LEN = 20000
-MAX_CHUNK_B64_LEN = 400_000
-RATE_LIMIT_WINDOW = 5.0
-RATE_LIMIT_MAX_EVENTS = 80
-FILECHUNK_RATE_LIMIT = 1200
-FILECHUNK_WINDOW = 5.0
+START_TIME = time.monotonic()
 
 
 def generate_code():
-    return str(random.randint(100000, 999999))
+    return f"{secrets.randbelow(900000) + 100000:06d}"
 
 
-def resolve_target_sid(to):
-    if to in peers:
-        return to
-    return peer_id_to_sid.get(to)
+def resolve_target_sid(target):
+    if target in peers:
+        return target
+    return peer_id_to_sid.get(str(target or ""))
 
 
-def rate_limited(sid, weight=1, bucket="default", limit=RATE_LIMIT_MAX_EVENTS, window=RATE_LIMIT_WINDOW):
-    key = (sid, bucket)
-    now = time.time()
-    bucket_list = rate_buckets[key]
-    cutoff = now - window
-    while bucket_list and bucket_list[0] < cutoff:
-        bucket_list.pop(0)
-    if len(bucket_list) + weight > limit:
+def _coerce_int(value, default=0, minimum=None, maximum=None):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+
+    if minimum is not None:
+        result = max(minimum, result)
+
+    if maximum is not None:
+        result = min(maximum, result)
+
+    return result
+
+
+def _clean_text(value, limit):
+    value = str(value or "")
+    value = value.replace("\x00", "")
+    return value[:limit]
+
+
+def _valid_device_id(value):
+    value = _clean_text(value, 64)
+    return value if DEVICE_ID_RE.fullmatch(value) else ""
+
+
+def _valid_peer_id(value):
+    value = _clean_text(value, 32)
+    return value if PEER_ID_RE.fullmatch(value) else ""
+
+
+def _valid_room(value):
+    value = _clean_text(value, 6)
+    return value if ROOM_CODE_RE.fullmatch(value) else ""
+
+
+def _safe_filename(value):
+    value = _clean_text(value, MAX_FILE_NAME_LEN)
+    value = value.replace("\r", " ").replace("\n", " ")
+    return value or "file"
+
+
+def _safe_file_type(value):
+    value = _clean_text(value, MAX_FILE_TYPE_LEN)
+    return value.replace("\r", "").replace("\n", "")
+
+
+def _safe_transfer_id(value):
+    return _clean_text(value, MAX_TRANSFER_ID_LEN)
+
+
+def _safe_batch_id(value):
+    return _clean_text(value, MAX_BATCH_ID_LEN)
+
+
+def rate_limited(
+    sid,
+    weight=1,
+    bucket="default",
+    limit=RATE_LIMIT_MAX_EVENTS,
+    window=RATE_LIMIT_WINDOW,
+):
+    if weight <= 0:
+        return False
+
+    if weight > limit:
         return True
-    for _ in range(weight):
-        bucket_list.append(now)
+
+    key = (sid, bucket)
+    now = time.monotonic()
+    queue = rate_buckets[key]
+    cutoff = now - window
+
+    while queue and queue[0][0] <= cutoff:
+        _, expired_weight = queue.popleft()
+        rate_totals[key] -= expired_weight
+
+    used = rate_totals[key]
+
+    if used + weight > limit:
+        return True
+
+    queue.append((now, weight))
+    rate_totals[key] += weight
     return False
 
 
-def guarded(weight=1, bucket="default", limit=None, window=None):
-    lim = limit or RATE_LIMIT_MAX_EVENTS
-    win = window or RATE_LIMIT_WINDOW
+def guarded(
+    weight=1,
+    bucket="default",
+    limit=None,
+    window=None,
+):
+    lim = RATE_LIMIT_MAX_EVENTS if limit is None else limit
+    win = RATE_LIMIT_WINDOW if window is None else window
 
-    def deco(fn):
+    def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             sid = request.sid
-            if sid in peers:
-                peers[sid]["last_seen"] = time.time()
-            if rate_limited(sid, weight, bucket, lim, win):
-                log.warning("rate limit hit sid=%s event=%s bucket=%s", sid, fn.__name__, bucket)
-                emit("rate_limited", {"event": fn.__name__})
+
+            info = peers.get(sid)
+            if info is not None:
+                info["last_seen"] = time.monotonic()
+
+            if rate_limited(
+                sid,
+                weight,
+                bucket,
+                lim,
+                win,
+            ):
+                log.warning(
+                    "rate limit sid=%s event=%s bucket=%s",
+                    sid,
+                    fn.__name__,
+                    bucket,
+                )
+                emit(
+                    "rate_limited",
+                    {"event": fn.__name__},
+                )
                 return False
+
             return fn(*args, **kwargs)
+
         return wrapper
-    return deco
+
+    return decorator
 
 
 def leave_current_room(sid):
     info = peers.get(sid)
     if not info:
         return
-    room = info.get("room")
-    if room and room != "Lobby":
-        leave_room(room)
-        rooms_index[room].discard(sid)
-        if not rooms_index[room]:
-            del rooms_index[room]
+
+    room = info.get("room") or "Lobby"
+
+    leave_room(room)
+
+    members = rooms_index.get(room)
+    if members is not None:
+        members.discard(sid)
+        if not members:
+            rooms_index.pop(room, None)
 
 
 def drop_rate_buckets(sid):
-    for key in [k for k in rate_buckets.keys() if k[0] == sid]:
-        rate_buckets.pop(key, None)
+    for key in tuple(rate_buckets):
+        if key[0] == sid:
+            rate_buckets.pop(key, None)
+            rate_totals.pop(key, None)
 
 
 def broadcast_peers(room):
-    if room == "Lobby":
-        member_sids = {sid for sid, info in peers.items() if info.get("room") == "Lobby"}
-        rooms_index["Lobby"] = member_sids
-    else:
-        member_sids = rooms_index.get(room, set())
+    members = rooms_index.get(room)
 
-    infos = [(sid, peers[sid]) for sid in member_sids if sid in peers]
-    by_sid = {sid: {"sid": sid, "id": info["id"], "name": info["name"]} for sid, info in infos}
-    for sid, _ in infos:
-        others = [v for k, v in by_sid.items() if k != sid]
-        socketio.emit("peers", others, room=sid)
+    if not members:
+        return
+
+    payload = [
+        {
+            "sid": sid,
+            "id": info["id"],
+            "name": info["name"],
+        }
+        for sid in members
+        if (info := peers.get(sid)) is not None
+    ]
+
+    socketio.emit("peers", payload, room=room)
+
+
+def remove_peer(sid, announce=True):
+    info = peers.pop(sid, None)
+    if not info:
+        return
+
+    room = info.get("room") or "Lobby"
+    peer_id = info.get("id")
+    device_id = info.get("device_id")
+
+    leave_room(room)
+
+    members = rooms_index.get(room)
+    if members is not None:
+        members.discard(sid)
+        if not members:
+            rooms_index.pop(room, None)
+
+    drop_rate_buckets(sid)
+
+    if peer_id and peer_id_to_sid.get(peer_id) == sid:
+        peer_id_to_sid.pop(peer_id, None)
+
+    if device_id and device_to_peer_id.get(device_id) == peer_id:
+        device_to_peer_id.pop(device_id, None)
+
+    if announce:
+        broadcast_peers(room)
 
 
 def cleanup_stale_peers():
     while True:
         socketio.sleep(CLEANUP_INTERVAL)
-        now = time.time()
-        stale = [sid for sid, info in peers.items() if now - info.get("last_seen", now) > STALE_TTL]
+
+        now = time.monotonic()
+
+        stale = [
+            sid
+            for sid, info in tuple(peers.items())
+            if now - info.get("last_seen", now) > STALE_TTL
+        ]
+
         for sid in stale:
             log.info("dropping stale peer sid=%s", sid)
-            info = peers.get(sid, {})
-            room = info.get("room")
-            peer_id = info.get("id")
-            leave_current_room(sid)
-            peers.pop(sid, None)
-            drop_rate_buckets(sid)
-            if peer_id and peer_id_to_sid.get(peer_id) == sid:
-                del peer_id_to_sid[peer_id]
-            if room:
-                broadcast_peers(room)
+            remove_peer(sid)
 
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE, app_version=APP_VERSION)
+    return render_template_string(
+        HTML_TEMPLATE,
+        app_version=APP_VERSION,
+    )
 
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "peers": len(peers), "version": APP_VERSION}, 200
+    return {
+        "status": "ok",
+        "peers": len(peers),
+        "version": APP_VERSION,
+        "uptime": int(time.monotonic() - START_TIME),
+    }, 200
 
 
 @socketio.on("connect")
 def handle_connect():
     sid = request.sid
-    fp = re.sub(r"[^a-f0-9]", "", (request.args.get("fp") or ""))[:128]
 
-    if fp and fp in fp_to_peer_id:
-        peer_id = fp_to_peer_id[fp]
-    else:
-        peer_id = str(uuid.uuid4())[:8]
-        if fp:
-            fp_to_peer_id[fp] = peer_id
+    device_id = _valid_device_id(
+        request.args.get("did")
+        or request.args.get("fp")
+        or ""
+    )
+
+    requested_peer_id = _valid_peer_id(
+        request.args.get("pid")
+        or ""
+    )
+
+    peer_id = device_to_peer_id.get(
+        device_id
+    ) or requested_peer_id
+
+    if not peer_id:
+        peer_id = uuid.uuid4().hex[:12]
+
+    old_sid = peer_id_to_sid.get(peer_id)
+
+    if old_sid and old_sid != sid:
+        remove_peer(old_sid, announce=False)
+        try:
+            disconnect(
+                old_sid,
+                namespace="/",
+                silent=True,
+            )
+        except Exception:
+            pass
+
+    if not device_id:
+        device_id = secrets.token_urlsafe(18).replace("-", "_")[:24]
 
     room = peer_last_room.get(peer_id, "Lobby")
-    name = peer_last_name.get(peer_id, "Device " + peer_id[-4:].upper())
+    name = peer_last_name.get(
+        peer_id,
+        "Device " + peer_id[-4:].upper(),
+    )
 
     peers[sid] = {
         "id": peer_id,
         "name": name,
-        "joined": time.time(),
-        "last_seen": time.time(),
+        "joined": time.monotonic(),
+        "last_seen": time.monotonic(),
         "room": room,
-        "fp": fp,
+        "device_id": device_id,
     }
+
     peer_id_to_sid[peer_id] = sid
+    device_to_peer_id[device_id] = peer_id
+
     join_room(room)
     rooms_index[room].add(sid)
-    emit("init", {"peer_id": peer_id, "sid": sid, "room": room, "name": name})
+
+    emit(
+        "init",
+        {
+            "peer_id": peer_id,
+            "sid": sid,
+            "room": room,
+            "name": name,
+        },
+    )
+
     broadcast_peers(room)
 
 
 @socketio.on("disconnect")
 def handle_disconnect():
-    sid = request.sid
-    info = peers.get(sid, {})
-    room = info.get("room")
-    peer_id = info.get("id")
-    leave_current_room(sid)
-    peers.pop(sid, None)
-    drop_rate_buckets(sid)
-    if peer_id and peer_id_to_sid.get(peer_id) == sid:
-        del peer_id_to_sid[peer_id]
-    if room:
-        broadcast_peers(room)
+    remove_peer(request.sid)
 
 
 @socketio.on("set_name")
 @guarded()
 def handle_set_name(data):
     sid = request.sid
+
     if sid not in peers or not isinstance(data, dict):
         return
-    raw = str(data.get("name", "")).strip()
-    if raw and NAME_RE.match(raw):
+
+    raw = _clean_text(
+        data.get("name", ""),
+        MAX_NAME_LEN,
+    ).strip()
+
+    if raw and NAME_RE.fullmatch(raw):
         peers[sid]["name"] = raw
         peer_last_name[peers[sid]["id"]] = raw
         broadcast_peers(peers[sid]["room"])
@@ -222,23 +430,40 @@ def handle_set_name(data):
 @guarded()
 def handle_join_room_code(data):
     sid = request.sid
+
     if sid not in peers or not isinstance(data, dict):
         return
-    code = str(data.get("code", "")).strip()
-    if not ROOM_CODE_RE.match(code):
-        emit("room_error", {"msg": "Invalid code"})
+
+    code = _valid_room(data.get("code"))
+
+    if not code:
+        emit(
+            "room_error",
+            {"msg": "Invalid code"},
+        )
         return
+
     old_room = peers[sid].get("room")
+
     if old_room == code:
         emit("room_joined", {"code": code})
         return
+
     leave_current_room(sid)
+
     join_room(code)
+
     peers[sid]["room"] = code
     peer_last_room[peers[sid]["id"]] = code
     rooms_index[code].add(sid)
-    emit("room_joined", {"code": code})
+
+    emit(
+        "room_joined",
+        {"code": code},
+    )
+
     broadcast_peers(code)
+
     if old_room:
         broadcast_peers(old_room)
 
@@ -247,19 +472,34 @@ def handle_join_room_code(data):
 @guarded()
 def handle_create_room_code():
     sid = request.sid
+
     if sid not in peers:
         return
+
     code = generate_code()
+
     while code in rooms_index:
         code = generate_code()
+
     old_room = peers[sid].get("room")
+
     leave_current_room(sid)
     join_room(code)
+
     peers[sid]["room"] = code
     peer_last_room[peers[sid]["id"]] = code
     rooms_index[code] = {sid}
-    emit("room_joined", {"code": code, "created": True})
+
+    emit(
+        "room_joined",
+        {
+            "code": code,
+            "created": True,
+        },
+    )
+
     broadcast_peers(code)
+
     if old_room:
         broadcast_peers(old_room)
 
@@ -268,39 +508,63 @@ def handle_create_room_code():
 @guarded()
 def handle_leave_room_code():
     sid = request.sid
+
     if sid not in peers:
         return
+
     old_room = peers[sid].get("room")
+
     leave_current_room(sid)
     join_room("Lobby")
+
     peers[sid]["room"] = "Lobby"
     peer_last_room[peers[sid]["id"]] = "Lobby"
     rooms_index["Lobby"].add(sid)
+
     emit("room_left", {})
+
     broadcast_peers("Lobby")
+
     if old_room:
         broadcast_peers(old_room)
 
 
 def _same_room(sid_a, sid_b):
-    a, b = peers.get(sid_a), peers.get(sid_b)
-    return bool(a and b and a.get("room") == b.get("room"))
+    a = peers.get(sid_a)
+    b = peers.get(sid_b)
+
+    return bool(
+        a
+        and b
+        and a.get("room") == b.get("room")
+    )
 
 
 @socketio.on("signal")
 @guarded(weight=2)
 def handle_signal(data):
-    if not isinstance(data, dict):
-        return
     sid = request.sid
+
+    if sid not in peers or not isinstance(data, dict):
+        return
+
     target_sid = resolve_target_sid(data.get("to"))
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("signal", {
-            "from": sid,
-            "from_peer": peers[sid]["id"],
-            "from_name": peers[sid]["name"],
-            "signal": data.get("signal")
-        }, room=target_sid)
+
+    if (
+        target_sid in peers
+        and target_sid != sid
+        and _same_room(sid, target_sid)
+    ):
+        emit(
+            "signal",
+            {
+                "from": sid,
+                "from_peer": peers[sid]["id"],
+                "from_name": peers[sid]["name"],
+                "signal": data.get("signal"),
+            },
+            room=target_sid,
+        )
 
 
 @socketio.on("broadcast_request")
@@ -308,21 +572,50 @@ def handle_signal(data):
 def handle_broadcast_request(data):
     if not isinstance(data, dict):
         return
+
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("transfer_request", {
-            "from": sid,
-            "from_peer": peers[sid]["id"],
-            "from_name": peers[sid]["name"],
-            "file_name": str(data.get("file_name", "file"))[:255],
-            "file_size": int(data.get("file_size", 0) or 0),
-            "file_type": str(data.get("file_type", ""))[:100],
-            "transfer_id": str(data.get("transfer_id", ""))[:64],
-            "batch_id": str(data.get("batch_id", ""))[:64],
-            "batch_total": int(data.get("batch_total", 1) or 1),
-            "batch_index": int(data.get("batch_index", 0) or 0),
-        }, room=target_sid)
+
+    if (
+        target_sid in peers
+        and target_sid != sid
+        and _same_room(sid, target_sid)
+    ):
+        emit(
+            "transfer_request",
+            {
+                "from": sid,
+                "from_peer": peers[sid]["id"],
+                "from_name": peers[sid]["name"],
+                "file_name": _safe_filename(
+                    data.get("file_name", "file")
+                ),
+                "file_size": _coerce_int(
+                    data.get("file_size"),
+                    maximum=MAX_FILE_BYTES,
+                ),
+                "file_type": _safe_file_type(
+                    data.get("file_type", "")
+                ),
+                "transfer_id": _safe_transfer_id(
+                    data.get("transfer_id")
+                ),
+                "batch_id": _safe_batch_id(
+                    data.get("batch_id")
+                ),
+                "batch_total": _coerce_int(
+                    data.get("batch_total"),
+                    default=1,
+                    minimum=1,
+                    maximum=10_000,
+                ),
+                "batch_index": _coerce_int(
+                    data.get("batch_index"),
+                    maximum=10_000,
+                ),
+            },
+            room=target_sid,
+        )
 
 
 @socketio.on("broadcast_response")
@@ -330,14 +623,28 @@ def handle_broadcast_request(data):
 def handle_broadcast_response(data):
     if not isinstance(data, dict):
         return
+
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("transfer_response", {
-            "from": sid,
-            "accepted": bool(data.get("accepted", False)),
-            "transfer_id": str(data.get("transfer_id", ""))[:64]
-        }, room=target_sid)
+
+    if (
+        target_sid in peers
+        and target_sid != sid
+        and _same_room(sid, target_sid)
+    ):
+        emit(
+            "transfer_response",
+            {
+                "from": sid,
+                "accepted": bool(
+                    data.get("accepted", False)
+                ),
+                "transfer_id": _safe_transfer_id(
+                    data.get("transfer_id")
+                ),
+            },
+            room=target_sid,
+        )
 
 
 @socketio.on("relay_text")
@@ -345,15 +652,27 @@ def handle_broadcast_response(data):
 def handle_relay_text(data):
     if not isinstance(data, dict):
         return
+
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
-    text = str(data.get("text", ""))[:MAX_TEXT_LEN]
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("relay_text", {
-            "from": sid,
-            "from_name": peers[sid]["name"],
-            "text": text
-        }, room=target_sid)
+
+    if (
+        target_sid in peers
+        and target_sid != sid
+        and _same_room(sid, target_sid)
+    ):
+        emit(
+            "relay_text",
+            {
+                "from": sid,
+                "from_name": peers[sid]["name"],
+                "text": _clean_text(
+                    data.get("text", ""),
+                    MAX_TEXT_LEN,
+                ),
+            },
+            room=target_sid,
+        )
 
 
 @socketio.on("relay_file_start")
@@ -361,41 +680,147 @@ def handle_relay_text(data):
 def handle_relay_file_start(data):
     if not isinstance(data, dict):
         return
+
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("relay_file_start", {
+
+    if (
+        target_sid not in peers
+        or target_sid == sid
+        or not _same_room(sid, target_sid)
+    ):
+        return
+
+    file_size = _coerce_int(
+        data.get("file_size"),
+        maximum=MAX_FILE_BYTES,
+    )
+
+    if file_size <= 0:
+        return
+
+    chunk_size = _coerce_int(
+        data.get("chunk_size"),
+        default=96 * 1024,
+        minimum=1024,
+        maximum=MAX_CHUNK_BYTES,
+    )
+
+    total_chunks = max(
+        1,
+        (file_size + chunk_size - 1) // chunk_size,
+    )
+
+    emit(
+        "relay_file_start",
+        {
             "from": sid,
             "from_name": peers[sid]["name"],
-            "file_name": str(data.get("file_name", "file"))[:255],
-            "file_size": int(data.get("file_size", 0) or 0),
-            "file_type": str(data.get("file_type", ""))[:100],
-            "transfer_id": str(data.get("transfer_id", ""))[:64],
-            "batch_id": str(data.get("batch_id", ""))[:64],
-            "batch_total": int(data.get("batch_total", 1) or 1),
-            "batch_index": int(data.get("batch_index", 0) or 0),
-        }, room=target_sid)
+            "file_name": _safe_filename(
+                data.get("file_name", "file")
+            ),
+            "file_size": file_size,
+            "file_type": _safe_file_type(
+                data.get("file_type", "")
+            ),
+            "transfer_id": _safe_transfer_id(
+                data.get("transfer_id")
+            ),
+            "batch_id": _safe_batch_id(
+                data.get("batch_id")
+            ),
+            "batch_total": _coerce_int(
+                data.get("batch_total"),
+                default=1,
+                minimum=1,
+                maximum=10_000,
+            ),
+            "batch_index": _coerce_int(
+                data.get("batch_index"),
+                maximum=10_000,
+            ),
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+        },
+        room=target_sid,
+    )
 
 
 @socketio.on("relay_file_chunk")
-@guarded(weight=1, bucket="filechunk", limit=FILECHUNK_RATE_LIMIT, window=FILECHUNK_WINDOW)
+@guarded(
+    bucket="file_events",
+    limit=1200,
+    window=5.0,
+)
 def handle_relay_file_chunk(data):
     if not isinstance(data, dict):
         return False
+
     sid = request.sid
-    target_sid = resolve_target_sid(data.get("to"))
-    chunk = data.get("chunk", "")
-    if not isinstance(chunk, str) or len(chunk) > MAX_CHUNK_B64_LEN:
+    target_sid = resolve_target_sid(
+        data.get("to")
+    )
+
+    if (
+        target_sid not in peers
+        or target_sid == sid
+        or not _same_room(sid, target_sid)
+    ):
         return False
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("relay_file_chunk", {
+
+    raw_chunk = data.get("chunk")
+
+    if isinstance(raw_chunk, (bytes, bytearray, memoryview)):
+        chunk = bytes(raw_chunk)
+    elif isinstance(raw_chunk, str):
+        try:
+            chunk = base64.b64decode(
+                raw_chunk,
+                validate=True,
+            )
+        except Exception:
+            return False
+    else:
+        return False
+
+    if not chunk or len(chunk) > MAX_CHUNK_BYTES:
+        return False
+
+    if rate_limited(
+        sid,
+        len(chunk),
+        bucket="file_bytes",
+        limit=FILECHUNK_RATE_BYTES,
+        window=RATE_LIMIT_WINDOW,
+    ):
+        emit(
+            "rate_limited",
+            {"event": "relay_file_chunk"},
+        )
+        return False
+
+    seq = _coerce_int(
+        data.get("seq"),
+        minimum=0,
+        maximum=(MAX_FILE_BYTES // 1024) + 1,
+    )
+
+    transfer_id = _safe_transfer_id(
+        data.get("transfer_id")
+    )
+
+    socketio.emit(
+        "relay_file_chunk",
+        {
             "from": sid,
-            "transfer_id": str(data.get("transfer_id", ""))[:64],
+            "transfer_id": transfer_id,
             "chunk": chunk,
-            "seq": int(data.get("seq", 0) or 0)
-        }, room=target_sid)
-        return True
-    return False
+            "seq": seq,
+        },
+        room=target_sid,
+    )
+
+    return True
 
 
 @socketio.on("relay_file_done")
@@ -403,13 +828,30 @@ def handle_relay_file_chunk(data):
 def handle_relay_file_done(data):
     if not isinstance(data, dict):
         return
+
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
-    if target_sid in peers and _same_room(sid, target_sid):
-        emit("relay_file_done", {
-            "from": sid,
-            "transfer_id": str(data.get("transfer_id", ""))[:64]
-        }, room=target_sid)
+
+    if (
+        target_sid in peers
+        and target_sid != sid
+        and _same_room(sid, target_sid)
+    ):
+        emit(
+            "relay_file_done",
+            {
+                "from": sid,
+                "transfer_id": _safe_transfer_id(
+                    data.get("transfer_id")
+                ),
+                "total_chunks": _coerce_int(
+                    data.get("total_chunks"),
+                    default=1,
+                    minimum=1,
+                ),
+            },
+            room=target_sid,
+        )
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -802,7 +1244,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="toast" id="toast"></div>
 <script>
-/* ========== PairMe client v2.3 ========== */
+/* ========== PairMe client v3.1 ========== */
 var socket = null;
 var mySid = "";
 var myPeerId = "";
@@ -814,43 +1256,48 @@ var pendingFileQueue = {};
 var relayFileQueue = {};
 var relayBuffer = {};
 var relayMeta = {};
+var relayReceivedBytes = {};
+var relayReceivedCount = {};
+var relayCleanupTimers = {};
 var textStore = {};
 var batchStore = {};
 var mediaRegistry = {};
 var lightboxItems = [];
 var lightboxIndex = 0;
 var lightboxMode = {};
-var CHUNK_SIZE = 16384;
+
+var P2P_CHUNK_SIZE = 32 * 1024;
+var RELAY_CHUNK_SIZE = 96 * 1024;
+var P2P_LOW_WATER = 256 * 1024;
+var P2P_HIGH_WATER = 1024 * 1024;
+var RELAY_WINDOW = 16;
+var RELAY_MAX_RETRIES = 7;
+var RELAY_RETRY_BASE = 80;
+
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
-        {
-            urls: [
-                "turn:openrelay.metered.ca:80",
-                "turn:openrelay.metered.ca:443",
-                "turn:openrelay.metered.ca:443?transport=tcp"
-            ],
-            username: "openrelayproject",
-            credential: "openrelayproject"
-        }
+        { urls: "stun:stun.cloudflare.com:3478" }
     ],
-    iceCandidatePoolSize: 4
+    iceCandidatePoolSize: 2
 };
-var WEBRTC_SUPPORTED = (typeof window.RTCPeerConnection === "function");
-var DEVICE_FP = null;
+
+var WEBRTC_SUPPORTED =
+    (typeof window.RTCPeerConnection === "function");
+
 var activeTransfers = 0;
-var RELAY_BATCH_CONCURRENCY = 3;
-var P2P_CONNECT_TIMEOUT = 10000;
 var peerConnState = {};
+var MAX_PREWARM_PEERS = 2;
+var peerRenderRaf = 0;
+var progressRaf = 0;
+var progressState = null;
+var p2pFallbackTimers = {};
+var prewarmTimers = {};
+var toastTimer = null;
 var pendingShareOpen = false;
 var urlRoomCode = null;
-var toastTimer = null;
 var openDlPop = null;
-
+var P2P_CONNECT_TIMEOUT = 7000;
 function switchTab(tab) {
     var cards = ["devices", "transfer", "logs"];
     for (var i = 0; i < cards.length; i++) {
@@ -864,15 +1311,69 @@ function switchTab(tab) {
 
 function log(msg, type) {
     type = type || "info";
-    var el = document.getElementById("log-container");
+
+    var el =
+        document.getElementById(
+            "log-container"
+        );
+
+    if (!el) return;
+
+    var wasAtBottom =
+        el.scrollHeight
+        - el.scrollTop
+        - el.clientHeight
+        < 32;
+
     var now = new Date();
-    var time = now.getHours() + ":" + ("0" + now.getMinutes()).slice(-2) + ":" + ("0" + now.getSeconds()).slice(-2);
-    var entry = document.createElement("div");
+
+    var time =
+        now.getHours()
+        + ":"
+        + ("0" + now.getMinutes()).slice(-2)
+        + ":"
+        + ("0" + now.getSeconds()).slice(-2);
+
+    var entry =
+        document.createElement("div");
+
     entry.className = "log-entry";
-    entry.innerHTML = '<span class="log-time">' + time + '</span><span class="log-tag tag-' + type + '">' + type + '</span><span style="word-break:break-all;">' + escapeHtml(msg) + '</span>';
+
+    var timeEl =
+        document.createElement("span");
+
+    timeEl.className = "log-time";
+    timeEl.textContent = time;
+
+    var tagEl =
+        document.createElement("span");
+
+    tagEl.className =
+        "log-tag tag-" + type;
+    tagEl.textContent = type;
+
+    var msgEl =
+        document.createElement("span");
+
+    msgEl.style.wordBreak =
+        "break-all";
+    msgEl.textContent =
+        String(msg);
+
+    entry.appendChild(timeEl);
+    entry.appendChild(tagEl);
+    entry.appendChild(msgEl);
+
     el.appendChild(entry);
-    el.scrollTop = el.scrollHeight;
-    while (el.children.length > 200) el.removeChild(el.firstChild);
+
+    while (el.childElementCount > 160) {
+        el.firstElementChild.remove();
+    }
+
+    if (wasAtBottom) {
+        el.scrollTop =
+            el.scrollHeight;
+    }
 }
 
 function clearLogs() {
@@ -894,11 +1395,44 @@ function escapeHtml(text) {
 }
 
 function formatBytes(bytes) {
-    if (!bytes) return "0 B";
-    var k = 1024;
-    var sizes = ["B", "KB", "MB", "GB"];
-    var i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    bytes = Number(bytes) || 0;
+
+    if (bytes <= 0) {
+        return "0 B";
+    }
+
+    var units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB"
+    ];
+
+    var index = Math.floor(
+        Math.log(bytes) / Math.log(1024)
+    );
+
+    index = Math.max(
+        0,
+        Math.min(
+            units.length - 1,
+            index
+        )
+    );
+
+    var value =
+        bytes / Math.pow(1024, index);
+
+    return (
+        parseFloat(
+            value.toFixed(
+                index === 0 ? 0 : 1
+            )
+        )
+        + " "
+        + units[index]
+    );
 }
 
 function toggleTheme() {
@@ -1139,178 +1673,215 @@ function generateTransferId() {
     return Date.now() + "_" + Math.floor(Math.random() * 100000);
 }
 
-/* ---------- Fingerprint ---------- */
+/* ---------- Adaptive transport core ---------- */
 
-function fnv1aHash(str) {
-    var h = 0x811c9dc5;
-    for (var i = 0; i < str.length; i++) {
-        h ^= str.charCodeAt(i);
-        h = (h * 0x01000193) >>> 0;
+function setProgress(label, completed, total) {
+    progressState = {
+        label: label || "",
+        completed: Math.max(0, completed || 0),
+        total: Math.max(1, total || 1)
+    };
+
+    if (progressRaf) return;
+
+    var flush = function() {
+        progressRaf = 0;
+
+        var state = progressState;
+        if (!state) return;
+
+        var wrap = document.getElementById("progress-wrap");
+        var status = document.getElementById("send-status");
+        var pct = document.getElementById("send-pct");
+        var fill = document.getElementById("progress-fill");
+
+        if (!wrap || !status || !pct || !fill) return;
+
+        var ratio = Math.min(
+            1,
+            state.completed / state.total
+        );
+
+        status.textContent = state.label;
+        pct.textContent = Math.round(ratio * 100) + "%";
+        fill.style.width = (ratio * 100) + "%";
+    };
+
+    if (typeof requestAnimationFrame === "function") {
+        progressRaf = requestAnimationFrame(flush);
+    } else {
+        progressRaf = setTimeout(flush, 32);
     }
-    return h.toString(16);
 }
 
-function getCanvasFingerprint() {
-    try {
-        var canvas = document.createElement("canvas");
-        canvas.width = 220; canvas.height = 40;
-        var ctx = canvas.getContext("2d");
-        ctx.textBaseline = "top";
-        ctx.font = "14px 'Arial'";
-        ctx.fillStyle = "#f60";
-        ctx.fillRect(0, 0, 100, 20);
-        ctx.fillStyle = "#069";
-        ctx.fillText("pairme_fp_%!@#", 2, 2);
-        ctx.fillStyle = "rgba(102,204,0,0.7)";
-        ctx.fillText("device_id", 4, 14);
-        return canvas.toDataURL();
-    } catch (e) { return "no-canvas"; }
-}
-
-function getWebglFingerprint() {
-    try {
-        var canvas = document.createElement("canvas");
-        var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-        if (!gl) return "no-webgl";
-        var ext = gl.getExtension("WEBGL_debug_renderer_info");
-        var vendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
-        var renderer = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-        return vendor + "~" + renderer;
-    } catch (e) { return "no-webgl"; }
-}
-
-function getFontFingerprint() {
-    try {
-        var testFonts = ["Arial", "Courier New", "Georgia", "Times New Roman", "Verdana", "Comic Sans MS", "Impact", "PingFang SC", "Helvetica Neue"];
-        var baseFonts = ["monospace", "sans-serif", "serif"];
-        var testString = "mmmmmmmmmmlli";
-        var testSize = "72px";
-        var span = document.createElement("span");
-        span.style.position = "absolute";
-        span.style.left = "-9999px";
-        span.style.fontSize = testSize;
-        span.textContent = testString;
-        document.body.appendChild(span);
-        var baseSizes = {};
-        baseFonts.forEach(function(bf) {
-            span.style.fontFamily = bf;
-            baseSizes[bf] = span.offsetWidth + "x" + span.offsetHeight;
-        });
-        var detected = [];
-        testFonts.forEach(function(font) {
-            var found = false;
-            for (var i = 0; i < baseFonts.length; i++) {
-                span.style.fontFamily = "'" + font + "', " + baseFonts[i];
-                var size = span.offsetWidth + "x" + span.offsetHeight;
-                if (size !== baseSizes[baseFonts[i]]) { found = true; break; }
-            }
-            if (found) detected.push(font);
-        });
-        document.body.removeChild(span);
-        return detected.join(",");
-    } catch (e) { return "no-fonts"; }
-}
-
-function getAudioFingerprint() {
-    return new Promise(function(resolve) {
-        try {
-            var AudioCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-            if (!AudioCtx) return resolve("no-audio");
-            var ctx = new AudioCtx(1, 5000, 44100);
-            var osc = ctx.createOscillator();
-            osc.type = "triangle";
-            osc.frequency.setValueAtTime(10000, ctx.currentTime);
-            var compressor = ctx.createDynamicsCompressor();
-            osc.connect(compressor);
-            compressor.connect(ctx.destination);
-            osc.start(0);
-            ctx.startRendering();
-            ctx.oncomplete = function(e) {
-                var output = e.renderedBuffer.getChannelData(0);
-                var sum = 0;
-                for (var i = 4500; i < 5000; i++) sum += Math.abs(output[i]);
-                resolve(sum.toFixed(6));
-            };
-            setTimeout(function() { resolve("audio-timeout"); }, 800);
-        } catch (e) { resolve("no-audio"); }
-    });
-}
-
-function getHardwareFingerprint() {
-    var parts = [
-        navigator.hardwareConcurrency || 0,
-        navigator.deviceMemory || 0,
-        screen.width, screen.height, screen.colorDepth,
-        window.devicePixelRatio || 1,
-        navigator.platform || "",
-        navigator.maxTouchPoints || 0,
-        Intl.DateTimeFormat().resolvedOptions().timeZone || ""
-    ];
-    return parts.join("~");
-}
-
-function computeDeviceFingerprint() {
-    return getAudioFingerprint().then(function(audioFp) {
-        var raw = [
-            getCanvasFingerprint(),
-            getWebglFingerprint(),
-            getFontFingerprint(),
-            getHardwareFingerprint(),
-            audioFp
-        ].join("||");
-        var hash = fnv1aHash(raw) + fnv1aHash(raw.split("").reverse().join(""));
-        return hash;
-    });
-}
-
-function getOrComputeFingerprint() {
-    return computeDeviceFingerprint().then(function(hash) {
-        DEVICE_FP = hash;
-        return hash;
-    }).catch(function() {
-        var fallback = localStorage.getItem("pairme_fp_fallback");
-        if (!fallback) {
-            fallback = fnv1aHash(String(Date.now()) + String(Math.random()));
-            localStorage.setItem("pairme_fp_fallback", fallback);
+function hideProgressSoon() {
+    setTimeout(function() {
+        var wrap = document.getElementById("progress-wrap");
+        if (wrap && activeTransfers <= 0) {
+            wrap.style.display = "none";
         }
-        DEVICE_FP = fallback;
-        return fallback;
-    });
+    }, 400);
+}
+
+function makeRandomId() {
+    try {
+        if (window.crypto && crypto.randomUUID) {
+            return crypto.randomUUID();
+        }
+
+        if (window.crypto && crypto.getRandomValues) {
+            var bytes = new Uint8Array(18);
+            crypto.getRandomValues(bytes);
+
+            var output = "";
+            for (var i = 0; i < bytes.length; i++) {
+                output += bytes[i].toString(16).padStart(2, "0");
+            }
+            return output;
+        }
+    } catch (e) {}
+
+    return (
+        Date.now().toString(36)
+        + "_"
+        + Math.random().toString(36).slice(2)
+    );
+}
+
+function generateTransferId() {
+    return makeRandomId();
+}
+
+/* ---------- Local identity ---------- */
+
+function createLocalDeviceId() {
+    return makeRandomId().replace(
+        /[^A-Za-z0-9_-]/g,
+        ""
+    ).slice(0, 48);
+}
+
+function getOrCreateDeviceId() {
+    try {
+        var value = localStorage.getItem(
+            "pairme_device_id"
+        );
+
+        if (
+            value
+            && /^[A-Za-z0-9_-]{16,64}$/.test(value)
+        ) {
+            return Promise.resolve(value);
+        }
+
+        var created = createLocalDeviceId();
+
+        localStorage.setItem(
+            "pairme_device_id",
+            created
+        );
+
+        return Promise.resolve(created);
+    } catch (e) {
+        return Promise.resolve(
+            createLocalDeviceId()
+        );
+    }
 }
 
 /* ---------- Socket ---------- */
 
 function initSocket() {
-    getOrComputeFingerprint().then(function(fp) {
+    getOrCreateDeviceId().then(function(deviceId) {
+        var savedPeerId = "";
+
+        try {
+            savedPeerId =
+                localStorage.getItem(
+                    "pairme_peer_id"
+                ) || "";
+        } catch (e) {}
+
+        var query = { did: deviceId };
+
+        if (
+            /^[A-Za-z0-9_-]{8,32}$/.test(
+                savedPeerId
+            )
+        ) {
+            query.pid = savedPeerId;
+        }
+
         socket = io({
             transports: ["websocket", "polling"],
-            query: { fp: fp },
+            upgrade: true,
+            rememberUpgrade: true,
+            query: query,
             reconnection: true,
             reconnectionAttempts: Infinity,
-            reconnectionDelay: 1000,
-            reconnectionDelayMax: 8000,
-            randomizationFactor: 0.5,
-            timeout: 20000
+            reconnectionDelay: 300,
+            reconnectionDelayMax: 5000,
+            randomizationFactor: 0.35,
+            timeout: 12000
         });
+
         bindSocketEvents();
     });
 }
 
 function closeAllConnections() {
     Object.keys(connections).forEach(function(sid) {
-        try { connections[sid].close(); } catch(e){}
+        var pc = connections[sid];
+
+        if (pc) {
+            pc._manualClose = true;
+
+            if (pc.receiveTimers) {
+                Object.keys(pc.receiveTimers).forEach(
+                    function(id) {
+                        clearTimeout(
+                            pc.receiveTimers[id]
+                        );
+                    }
+                );
+            }
+
+            try {
+                pc.close();
+            } catch (e) {}
+        }
+
         delete connections[sid];
         delete peerConnState[sid];
     });
+
+    Object.keys(p2pFallbackTimers).forEach(function(sid) {
+        clearTimeout(
+            p2pFallbackTimers[sid]
+        );
+        delete p2pFallbackTimers[sid];
+    });
+
+    schedulePeerRender();
 }
 
 function bindSocketEvents() {
     socket.on("connect", function() {
         log("Connected to server", "success");
-        var saved = localStorage.getItem("pairme_name");
+
+        var saved = localStorage.getItem(
+            "pairme_name"
+        );
+
         if (saved) {
-            document.getElementById("my-name").value = saved;
-            socket.emit("set_name", { name: saved });
+            document.getElementById(
+                "my-name"
+            ).value = saved;
+
+            socket.emit(
+                "set_name",
+                { name: saved }
+            );
         }
     });
 
@@ -1318,474 +1889,1389 @@ function bindSocketEvents() {
         mySid = data.sid;
         myPeerId = data.peer_id;
         currentRoom = data.room || "Lobby";
-        document.getElementById("my-id").textContent = myPeerId;
-        document.getElementById("room-name").textContent = currentRoom;
-        if (data.name) {
-            document.getElementById("my-name").value = data.name;
-        }
-        log("ID: " + myPeerId, "info");
 
-        if (urlRoomCode && urlRoomCode !== currentRoom) {
-            log("Joining room from QR link: " + urlRoomCode, "info");
-            socket.emit("join_room_code", { code: urlRoomCode });
+        try {
+            localStorage.setItem(
+                "pairme_peer_id",
+                myPeerId
+            );
+        } catch (e) {}
+
+        document.getElementById(
+            "my-id"
+        ).textContent = myPeerId;
+
+        document.getElementById(
+            "room-name"
+        ).textContent = currentRoom;
+
+        if (data.name) {
+            document.getElementById(
+                "my-name"
+            ).value = data.name;
+        }
+
+        if (
+            urlRoomCode
+            && urlRoomCode !== currentRoom
+        ) {
+            socket.emit(
+                "join_room_code",
+                { code: urlRoomCode }
+            );
         } else {
             syncUrlWithRoom(currentRoom);
         }
+
         urlRoomCode = null;
     });
 
     socket.on("peers", function(data) {
-        peerList = data;
+        peerList = Array.isArray(data)
+            ? data.filter(function(p) {
+                return p
+                    && p.sid
+                    && p.sid !== mySid;
+            })
+            : [];
+
         renderPeers();
-        peerList.forEach(function(p) {
-            if (!connections[p.sid] || (!isDataChannelOpen(p.sid) && peerConnState[p.sid] !== "connecting" && peerConnState[p.sid] !== "p2p")) {
-                connectPeer(p.sid, false);
-            }
-        });
+        pruneConnections();
+        prewarmPeers();
     });
 
     socket.on("signal", handleSignal);
 
     socket.on("transfer_request", function(data) {
-        log("Incoming: " + data.file_name + " from " + data.from_name, "info");
-        socket.emit("broadcast_response", {
-            to: data.from,
-            accepted: true,
-            transfer_id: data.transfer_id
-        });
+        socket.emit(
+            "broadcast_response",
+            {
+                to: data.from,
+                accepted: true,
+                transfer_id: data.transfer_id
+            }
+        );
     });
 
     socket.on("transfer_response", function(data) {
         if (data.accepted) {
-            startDataTransfer(data.from, data.transfer_id);
-        } else {
-            log("Declined by peer", "warn");
-            var q = pendingFileQueue[data.from];
-            if (q && q.length && q[0].transfer_id === data.transfer_id) {
-                q.shift();
-            }
+            startDataTransfer(
+                data.from,
+                data.transfer_id
+            );
         }
     });
 
     socket.on("room_joined", function(data) {
         currentRoom = data.code;
-        document.getElementById("room-name").textContent = data.code;
+
+        document.getElementById(
+            "room-name"
+        ).textContent = data.code;
+
         syncUrlWithRoom(data.code);
-        log("Joined room " + data.code, "success");
         closeAllConnections();
+
         if (pendingShareOpen) {
             pendingShareOpen = false;
             populateShareModal();
-            document.getElementById("share-modal").style.display = "flex";
-        } else if (document.getElementById("share-modal").style.display === "flex") {
+
+            document.getElementById(
+                "share-modal"
+            ).style.display = "flex";
+        } else if (
+            document.getElementById(
+                "share-modal"
+            ).style.display === "flex"
+        ) {
             populateShareModal();
         }
     });
 
     socket.on("room_left", function() {
         currentRoom = "Lobby";
-        document.getElementById("room-name").textContent = "Lobby";
+
+        document.getElementById(
+            "room-name"
+        ).textContent = "Lobby";
+
         syncUrlWithRoom("Lobby");
         closeShareModal();
-        log("Switched to Lobby", "info");
         closeAllConnections();
     });
 
     socket.on("room_error", function(data) {
-        log("Room error: " + (data && data.msg ? data.msg : "unknown"), "error");
+        log(
+            "Room error: "
+            + (
+                data && data.msg
+                    ? data.msg
+                    : "unknown"
+            ),
+            "error"
+        );
         showToast("Invalid room code");
     });
 
     socket.on("relay_text", function(data) {
-        addReceived("text", data.text, data.from_name);
-        log("Text from " + data.from_name, "info");
+        addReceived(
+            "text",
+            data.text,
+            data.from_name
+        );
     });
 
     socket.on("relay_file_start", function(data) {
-        relayBuffer[data.transfer_id] = {};
-        relayMeta[data.transfer_id] = data;
-        log("Receiving " + data.file_name + (data.batch_total > 1 ? " (" + ((data.batch_index || 0) + 1) + "/" + data.batch_total + ")" : ""), "info");
+        var id = String(
+            data.transfer_id || ""
+        );
+
+        if (relayBuffer[id]) {
+            delete relayBuffer[id];
+            delete relayMeta[id];
+            delete relayReceivedBytes[id];
+            delete relayReceivedCount[id];
+        }
+
+        var size = Number(
+            data.file_size || 0
+        );
+
+        if (!id || size <= 0) return;
+
+        var chunkSize = Math.max(
+            1024,
+            Number(data.chunk_size)
+                || RELAY_CHUNK_SIZE
+        );
+
+        var count = Number(
+            data.total_chunks
+        );
+
+        if (
+            !Number.isInteger(count)
+            || count < 1
+        ) {
+            count = Math.ceil(
+                size / chunkSize
+            );
+        }
+
+        if (relayCleanupTimers[id]) {
+            clearTimeout(
+                relayCleanupTimers[id]
+            );
+        }
+
+        relayBuffer[id] = new Array(count);
+        relayMeta[id] = data;
+        relayReceivedBytes[id] = 0;
+        relayReceivedCount[id] = 0;
+
+        relayCleanupTimers[id] = setTimeout(
+            function() {
+                delete relayBuffer[id];
+                delete relayMeta[id];
+                delete relayReceivedBytes[id];
+                delete relayReceivedCount[id];
+                delete relayCleanupTimers[id];
+            },
+            10 * 60 * 1000
+        );
+
+        log(
+            "Receiving " + data.file_name,
+            "info"
+        );
     });
 
     socket.on("relay_file_chunk", function(data) {
-        if (relayBuffer[data.transfer_id]) {
-            try {
-                var binary = atob(data.chunk);
-                var bytes = new Uint8Array(binary.length);
-                for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-                relayBuffer[data.transfer_id][data.seq] = bytes.buffer;
-            } catch (e) {
-                log("Chunk decode error", "error");
-            }
+        var id = String(
+            data.transfer_id || ""
+        );
+
+        var chunks = relayBuffer[id];
+
+        if (!chunks) return;
+
+        var seq = Number(data.seq);
+
+        if (
+            !Number.isInteger(seq)
+            || seq < 0
+            || seq >= chunks.length
+            || chunks[seq]
+        ) {
+            return;
         }
+
+        var chunk = data.chunk;
+        var buffer = null;
+
+        if (chunk instanceof ArrayBuffer) {
+            buffer = chunk;
+        } else if (
+            typeof ArrayBuffer !== "undefined"
+            && ArrayBuffer.isView
+            && ArrayBuffer.isView(chunk)
+        ) {
+            buffer = chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset
+                    + chunk.byteLength
+            );
+        } else if (
+            chunk instanceof Blob
+        ) {
+            var localId = id;
+            var localSeq = seq;
+
+            chunk.arrayBuffer().then(
+                function(ab) {
+                    var current =
+                        relayBuffer[localId];
+
+                    if (
+                        !current
+                        || current[localSeq]
+                    ) {
+                        return;
+                    }
+
+                    current[localSeq] = ab;
+                    relayReceivedCount[localId]++;
+                    relayReceivedBytes[localId] += ab.byteLength;
+                }
+            ).catch(function() {});
+
+            return;
+        }
+
+        if (!buffer) return;
+
+        chunks[seq] = buffer;
+        relayReceivedCount[id]++;
+        relayReceivedBytes[id] += buffer.byteLength;
     });
 
     socket.on("relay_file_done", function(data) {
-        var meta = relayMeta[data.transfer_id];
-        var chunkMap = relayBuffer[data.transfer_id];
-        if (meta && chunkMap) {
-            var seqs = Object.keys(chunkMap).map(Number).sort(function(a, b) { return a - b; });
-            var ordered = seqs.map(function(s) { return chunkMap[s]; });
-            var blob = new Blob(ordered, { type: meta.file_type });
-            var url = URL.createObjectURL(blob);
-            addReceived("file", {
+        var id = String(
+            data.transfer_id || ""
+        );
+
+        var meta = relayMeta[id];
+        var chunks = relayBuffer[id];
+
+        if (!meta || !chunks) return;
+
+        var expectedChunks =
+            Number(meta.total_chunks)
+            || chunks.length;
+
+        var complete =
+            relayReceivedCount[id]
+                === expectedChunks
+            && relayReceivedBytes[id]
+                === Number(meta.file_size)
+            && chunks.every(Boolean);
+
+        if (!complete) {
+            log(
+                "Relay integrity failure: "
+                + meta.file_name,
+                "error"
+            );
+
+            delete relayBuffer[id];
+            delete relayMeta[id];
+            delete relayReceivedBytes[id];
+            delete relayReceivedCount[id];
+
+            if (relayCleanupTimers[id]) {
+                clearTimeout(
+                    relayCleanupTimers[id]
+                );
+                delete relayCleanupTimers[id];
+            }
+
+            return;
+        }
+
+        var blob = new Blob(
+            chunks,
+            {
+                type:
+                    meta.file_type
+                    || "application/octet-stream"
+            }
+        );
+
+        var url = trackObjectUrl(URL.createObjectURL(blob));
+
+        addReceived(
+            "file",
+            {
                 name: meta.file_name,
                 size: meta.file_size,
                 url: url,
                 type: meta.file_type,
                 blob: blob,
-                batch_id: meta.batch_id || "",
-                batch_total: meta.batch_total || 1,
-                batch_index: meta.batch_index || 0
-            }, meta.from_name);
-            log("Received " + meta.file_name + " (Relay)", "success");
-            delete relayBuffer[data.transfer_id];
-            delete relayMeta[data.transfer_id];
+                batch_id:
+                    meta.batch_id || "",
+                batch_total:
+                    meta.batch_total || 1,
+                batch_index:
+                    meta.batch_index || 0
+            },
+            meta.from_name
+        );
+
+        log(
+            "Received "
+            + meta.file_name
+            + " (Relay)",
+            "success"
+        );
+
+        delete relayBuffer[id];
+        delete relayMeta[id];
+        delete relayReceivedBytes[id];
+        delete relayReceivedCount[id];
+
+        if (relayCleanupTimers[id]) {
+            clearTimeout(
+                relayCleanupTimers[id]
+            );
+            delete relayCleanupTimers[id];
         }
     });
 
     socket.on("rate_limited", function(data) {
-        log("Too many requests, slow down (" + data.event + ")", "warn");
+        log(
+            "Rate limited: "
+            + (
+                data && data.event
+                    ? data.event
+                    : "request"
+            ),
+            "warn"
+        );
     });
 
     socket.on("disconnect", function() {
-        log("Disconnected from server", "warn");
+        Object.keys(connections).forEach(
+            function(sid) {
+                setPeerConnState(
+                    sid,
+                    "relay"
+                );
+            }
+        );
+
+        log(
+            "Disconnected from server",
+            "warn"
+        );
     });
 }
 
+/* ---------- Peer management ---------- */
+
 function isDataChannelOpen(sid) {
     var pc = connections[sid];
-    return pc && pc.dataChannel && pc.dataChannel.readyState === "open";
+
+    return !!(
+        pc
+        && pc.dataChannel
+        && pc.dataChannel.readyState === "open"
+    );
 }
 
 function setPeerConnState(sid, state) {
     peerConnState[sid] = state;
-    renderPeers();
+    schedulePeerRender();
+}
+
+function pruneConnections() {
+    var known = {};
+
+    peerList.forEach(function(p) {
+        known[p.sid] = true;
+    });
+
+    Object.keys(connections).forEach(
+        function(sid) {
+            if (known[sid]) return;
+
+            try {
+                connections[sid].close();
+            } catch (e) {}
+
+            delete connections[sid];
+            delete peerConnState[sid];
+        }
+    );
 }
 
 function renderPeers() {
-    var list = document.getElementById("peer-list");
-    var select = document.getElementById("peer-select");
-    var selected = select.value;
-    list.innerHTML = "";
-    select.innerHTML = '<option value="">-- All Devices --</option>';
+    var list = document.getElementById(
+        "peer-list"
+    );
 
-    if (peerList.length === 0) {
-        list.innerHTML = '<div class="empty-hint">No devices detected</div>';
-        return;
+    var select = document.getElementById(
+        "peer-select"
+    );
+
+    if (!list || !select) return;
+
+    var selected = select.value;
+
+    var fragment =
+        document.createDocumentFragment();
+
+    var empty = !peerList.length;
+
+    if (empty) {
+        var hint = document.createElement("div");
+        hint.className = "empty-hint";
+        hint.textContent =
+            "No devices detected";
+        fragment.appendChild(hint);
+    } else {
+        peerList.forEach(function(p) {
+            var state =
+                peerConnState[p.sid]
+                || (
+                    isDataChannelOpen(p.sid)
+                        ? "p2p"
+                        : "relay"
+                );
+
+            var item =
+                document.createElement("div");
+
+            item.className = "peer-item";
+            item.onclick = function() {
+                selectPeer(p.sid);
+            };
+
+            var info =
+                document.createElement("div");
+
+            info.className = "peer-info";
+
+            var name =
+                document.createElement("span");
+
+            name.className = "peer-name";
+            name.textContent = p.name || "Device";
+
+            var id =
+                document.createElement("span");
+
+            id.className = "peer-id";
+            id.textContent = p.id || "";
+
+            info.appendChild(name);
+            info.appendChild(id);
+
+            var right =
+                document.createElement("div");
+
+            right.style.cssText =
+                "display:flex;align-items:center;gap:6px;";
+
+            var status =
+                document.createElement("span");
+
+            status.className =
+                "peer-status "
+                + (
+                    state === "p2p"
+                        ? "status-p2p"
+                        : state === "connecting"
+                            ? "status-conn"
+                            : "status-relay"
+                );
+
+            status.textContent =
+                state === "p2p"
+                    ? "P2P"
+                    : state === "connecting"
+                        ? "…"
+                        : "Relay";
+
+            right.appendChild(status);
+
+            var arrow =
+                document.createElement("span");
+
+            arrow.textContent = "›";
+            arrow.style.fontSize = "20px";
+            arrow.style.lineHeight = "1";
+            right.appendChild(arrow);
+
+            item.appendChild(info);
+            item.appendChild(right);
+            fragment.appendChild(item);
+
+            var opt =
+                document.createElement("option");
+
+            opt.value = p.sid;
+            opt.textContent =
+                (p.name || "Device")
+                + " ("
+                + (p.id || "")
+                + ")";
+
+            select.appendChild(opt);
+        });
     }
 
-    peerList.forEach(function(p) {
-        var state = peerConnState[p.sid] || (isDataChannelOpen(p.sid) ? "p2p" : "relay");
-        var statusHtml = "";
-        if (state === "p2p") statusHtml = '<span class="peer-status status-p2p">P2P</span>';
-        else if (state === "connecting") statusHtml = '<span class="peer-status status-conn">…</span>';
-        else statusHtml = '<span class="peer-status status-relay">Relay</span>';
+    list.replaceChildren(fragment);
 
-        var item = document.createElement("div");
-        item.className = "peer-item";
-        item.onclick = function() { selectPeer(p.sid); };
-        item.innerHTML = '<div class="peer-info"><span class="peer-name">' + escapeHtml(p.name) + '</span><span class="peer-id">' + p.id + '</span></div>' +
-            '<div style="display:flex;align-items:center;gap:6px;">' + statusHtml +
-            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>';
-        list.appendChild(item);
-
-        var opt = document.createElement("option");
-        opt.value = p.sid;
-        opt.textContent = p.name + " (" + p.id + ")";
-        select.appendChild(opt);
-    });
-    if (selected) select.value = selected;
+    if (selected) {
+        select.value = selected;
+    }
 }
 
 function selectPeer(sid) {
-    document.getElementById("peer-select").value = sid;
+    var select = document.getElementById(
+        "peer-select"
+    );
+
+    select.value = sid;
     onPeerSelectChange();
+
     if (window.innerWidth <= 768) {
         switchTab("transfer");
     }
 }
 
 function onPeerSelectChange() {
-    var sid = document.getElementById("peer-select").value;
-    var label = document.getElementById("target-peer-label");
+    var sid = document.getElementById(
+        "peer-select"
+    ).value;
+
+    var label = document.getElementById(
+        "target-peer-label"
+    );
+
     if (sid) {
-        var p = peerList.find(function(x) { return x.sid === sid; });
-        label.textContent = "To: " + (p ? p.name : sid);
+        var p = peerList.find(function(x) {
+            return x.sid === sid;
+        });
+
+        label.textContent =
+            "To: " + (
+                p ? p.name : sid
+            );
+
         connectPeer(sid, true);
     } else {
-        label.textContent = "To: Everyone";
+        label.textContent =
+            "To: Everyone";
     }
 }
 
-function updateName() {
-    var name = document.getElementById("my-name").value.trim();
-    if (name) {
-        socket.emit("set_name", { name: name });
-        localStorage.setItem("pairme_name", name);
-        log("Updated name: " + name, "success");
+function prewarmPeers() {
+    if (!WEBRTC_SUPPORTED) return;
+
+    var targets = [];
+
+    var selected =
+        document.getElementById(
+            "peer-select"
+        ).value;
+
+    if (selected) {
+        targets.push(selected);
     }
+
+    for (var i = 0; i < peerList.length; i++) {
+        if (
+            targets.length >= MAX_PREWARM_PEERS
+            || targets.indexOf(
+                peerList[i].sid
+            ) >= 0
+        ) {
+            continue;
+        }
+
+        targets.push(peerList[i].sid);
+    }
+
+    targets.forEach(function(sid, index) {
+        if (isDataChannelOpen(sid)) return;
+        if (prewarmTimers[sid]) return;
+
+        prewarmTimers[sid] = setTimeout(
+            function() {
+                delete prewarmTimers[sid];
+                connectPeer(sid, false);
+            },
+            index * 120
+        );
+    });
+}
+
+/* ---------- Device / room controls ---------- */
+
+function updateName() {
+    var name =
+        document.getElementById(
+            "my-name"
+        ).value.trim();
+
+    if (!name) return;
+
+    socket.emit(
+        "set_name",
+        { name: name }
+    );
+
+    localStorage.setItem(
+        "pairme_name",
+        name
+    );
+
+    log(
+        "Updated device name",
+        "success"
+    );
 }
 
 function joinRoom() {
-    var code = document.getElementById("room-code-input").value.trim();
-    if (code.length === 6) socket.emit("join_room_code", { code: code });
+    var code =
+        document.getElementById(
+            "room-code-input"
+        ).value.trim();
+
+    if (/^\d{6}$/.test(code)) {
+        socket.emit(
+            "join_room_code",
+            { code: code }
+        );
+    }
 }
 
-function createRoom() { socket.emit("create_room_code"); }
-function leaveRoom() { socket.emit("leave_room_code"); }
+function createRoom() {
+    socket.emit("create_room_code");
+}
+
+function leaveRoom() {
+    socket.emit("leave_room_code");
+}
 
 /* ---------- WebRTC ---------- */
 
-function getOrCreateConnection(targetSid, isInitiator) {
-    if (!WEBRTC_SUPPORTED) return null;
-    if (connections[targetSid] && connections[targetSid].connectionState !== "closed" && connections[targetSid].connectionState !== "failed") {
-        return connections[targetSid];
+function scheduleConnectionRetry(
+    targetSid,
+    pc
+) {
+    if (
+        pc._manualClose
+        || pc.connectionState === "connected"
+        || !connections[targetSid]
+        || connections[targetSid] !== pc
+    ) {
+        return;
     }
 
-    if (connections[targetSid]) {
-        try { connections[targetSid].close(); } catch(e){}
+    pc._retryCount = (
+        pc._retryCount || 0
+    );
+
+    if (pc._retryCount >= 3) {
+        fallbackPendingToRelay(targetSid);
+        return;
     }
 
-    var pc = new RTCPeerConnection(STUN_SERVERS);
+    pc._retryCount++;
+
+    var delay =
+        Math.min(
+            3500,
+            400 * Math.pow(
+                2,
+                pc._retryCount - 1
+            )
+        );
+
+    setTimeout(function() {
+        if (
+            pc._manualClose
+            || !connections[targetSid]
+            || connections[targetSid] !== pc
+        ) {
+            return;
+        }
+
+        try {
+            pc.restartIce();
+        } catch (e) {}
+
+        makeOffer(
+            pc,
+            targetSid
+        );
+    }, delay);
+}
+
+function getOrCreateConnection(
+    targetSid,
+    isInitiator
+) {
+    if (!WEBRTC_SUPPORTED) {
+        return null;
+    }
+
+    var existing =
+        connections[targetSid];
+
+    if (
+        existing
+        && existing.connectionState !== "closed"
+        && existing.connectionState !== "failed"
+    ) {
+        return existing;
+    }
+
+    if (existing) {
+        try {
+            existing.close();
+        } catch (e) {}
+    }
+
+    var pc = new RTCPeerConnection(
+        STUN_SERVERS
+    );
+
     pc.iceQueue = [];
     pc.targetSid = targetSid;
-    pc.receiveBuffer = {};
+    pc.receiveTransfers = {};
+    pc.receiveTimers = {};
+    pc.activeReceiveId = null;
     pc._makingOffer = false;
     pc._ignoreOffer = false;
-    pc._polite = (mySid < targetSid);
-    setPeerConnState(targetSid, "connecting");
+    pc._manualClose = false;
+    pc._polite = (
+        String(mySid)
+        > String(targetSid)
+    );
+    pc._retryCount = 0;
+
+    connections[targetSid] = pc;
+
+    setPeerConnState(
+        targetSid,
+        "connecting"
+    );
 
     pc.onicecandidate = function(e) {
-        if (e.candidate) {
-            socket.emit("signal", { to: targetSid, signal: { type: "ice", candidate: e.candidate } });
-        }
-    };
+        if (!e.candidate || !socket) return;
 
-    pc.onconnectionstatechange = function() {
-        var st = pc.connectionState;
-        if (st === "connected") {
-            if (isDataChannelOpen(targetSid)) setPeerConnState(targetSid, "p2p");
-        } else if (st === "failed" || st === "disconnected") {
-            log("P2P state " + st + " with " + targetSid.slice(0, 6), "warn");
-            setPeerConnState(targetSid, "failed");
-            if (!pc._restarted) {
-                pc._restarted = true;
-                try {
-                    pc.restartIce();
-                    if (isInitiator || pc._polite) {
-                        makeOffer(pc, targetSid);
-                    }
-                } catch (err) {}
+        socket.emit(
+            "signal",
+            {
+                to: targetSid,
+                signal: {
+                    type: "ice",
+                    candidate: e.candidate
+                }
             }
-        } else if (st === "closed") {
-            setPeerConnState(targetSid, "relay");
-        }
+        );
     };
 
-    pc.oniceconnectionstatechange = function() {
-        if (pc.iceConnectionState === "failed") {
-            setPeerConnState(targetSid, "failed");
-        }
-    };
+    pc.onconnectionstatechange =
+        function() {
+            var state =
+                pc.connectionState;
+
+            if (state === "connected") {
+                pc._retryCount = 0;
+                setPeerConnState(
+                    targetSid,
+                    isDataChannelOpen(targetSid)
+                        ? "p2p"
+                        : "connecting"
+                );
+                startNextP2PTransfer(
+                    targetSid
+                );
+            } else if (
+                state === "disconnected"
+                || state === "failed"
+            ) {
+                setPeerConnState(
+                    targetSid,
+                    "relay"
+                );
+
+                scheduleConnectionRetry(
+                    targetSid,
+                    pc
+                );
+            } else if (state === "closed") {
+                setPeerConnState(
+                    targetSid,
+                    "relay"
+                );
+
+                fallbackPendingToRelay(
+                    targetSid
+                );
+            }
+        };
+
+    pc.oniceconnectionstatechange =
+        function() {
+            var state =
+                pc.iceConnectionState;
+
+            if (state === "failed") {
+                scheduleConnectionRetry(
+                    targetSid,
+                    pc
+                );
+            }
+        };
 
     pc.ondatachannel = function(e) {
-        setupDataChannel(pc, e.channel, targetSid);
+        setupDataChannel(
+            pc,
+            e.channel,
+            targetSid
+        );
     };
 
     if (isInitiator) {
-        var channel = pc.createDataChannel("pairme", { ordered: true, negotiated: false });
-        setupDataChannel(pc, channel, targetSid);
+        var channel =
+            pc.createDataChannel(
+                "pairme",
+                {
+                    ordered: true,
+                    negotiated: false
+                }
+            );
+
+        setupDataChannel(
+            pc,
+            channel,
+            targetSid
+        );
     }
 
-    connections[targetSid] = pc;
     return pc;
 }
 
-function setupDataChannel(pc, channel, targetSid) {
+function setupDataChannel(
+    pc,
+    channel,
+    targetSid
+) {
     pc.dataChannel = channel;
     channel.binaryType = "arraybuffer";
 
     try {
-        channel.bufferedAmountLowThreshold = CHUNK_SIZE * 4;
+        channel.bufferedAmountLowThreshold =
+            P2P_LOW_WATER;
     } catch (e) {}
 
     channel.onopen = function() {
-        log("P2P open with " + targetSid.slice(0, 6), "p2p");
-        setPeerConnState(targetSid, "p2p");
-        if (pendingFileQueue[targetSid] && pendingFileQueue[targetSid].length) {
-            var first = pendingFileQueue[targetSid][0];
-            socket.emit("broadcast_request", {
-                to: first.target_peer_id,
-                file_name: first.file.name,
-                file_size: first.file.size,
-                file_type: first.file.type,
-                transfer_id: first.transfer_id,
-                batch_id: first.batch_id,
-                batch_total: first.batch_total,
-                batch_index: first.batch_index
-            });
-        }
+        pc._retryCount = 0;
+
+        setPeerConnState(
+            targetSid,
+            "p2p"
+        );
+
+        startNextP2PTransfer(
+            targetSid
+        );
     };
 
     channel.onclose = function() {
-        log("P2P closed " + targetSid.slice(0, 6), "warn");
-        setPeerConnState(targetSid, "relay");
+        setPeerConnState(
+            targetSid,
+            "relay"
+        );
+
+        if (!pc._manualClose) {
+            fallbackPendingToRelay(
+                targetSid
+            );
+        }
     };
 
-    channel.onerror = function(err) {
-        log("Channel error: " + (err.message || err), "error");
-        setPeerConnState(targetSid, "failed");
+    channel.onerror = function() {
+        setPeerConnState(
+            targetSid,
+            "failed"
+        );
     };
 
     channel.onmessage = function(e) {
-        handleDataMessage(e.data, targetSid);
+        handleDataMessage(
+            e.data,
+            targetSid
+        );
     };
 }
 
-function makeOffer(pc, targetSid) {
-    if (pc._makingOffer) return;
+function makeOffer(
+    pc,
+    targetSid
+) {
+    if (
+        pc._makingOffer
+        || pc._manualClose
+    ) {
+        return;
+    }
+
+    if (
+        pc.signalingState !== "stable"
+        && pc.signalingState !== "have-local-offer"
+    ) {
+        return;
+    }
+
     pc._makingOffer = true;
+
     pc.createOffer()
-        .then(function(offer) { return pc.setLocalDescription(offer); })
-        .then(function() {
-            socket.emit("signal", { to: targetSid, signal: { type: "offer", sdp: pc.localDescription } });
+        .then(function(offer) {
+            return pc.setLocalDescription(
+                offer
+            );
         })
-        .catch(function(err) { log("Offer err: " + err.message, "error"); })
-        .finally(function() { pc._makingOffer = false; });
+        .then(function() {
+            if (!socket) return;
+
+            socket.emit(
+                "signal",
+                {
+                    to: targetSid,
+                    signal: {
+                        type: "offer",
+                        sdp: pc.localDescription
+                    }
+                }
+            );
+        })
+        .catch(function(err) {
+            log(
+                "Offer failed: "
+                + (
+                    err.message || err
+                ),
+                "warn"
+            );
+        })
+        .finally(function() {
+            pc._makingOffer = false;
+        });
+}
+
+function flushIceQueue(pc) {
+    if (
+        !pc.remoteDescription
+        || !pc.remoteDescription.type
+    ) {
+        return Promise.resolve();
+    }
+
+    var queue = pc.iceQueue.splice(
+        0,
+        pc.iceQueue.length
+    );
+
+    return Promise.all(
+        queue.map(function(candidate) {
+            return pc.addIceCandidate(
+                candidate
+            ).catch(function() {});
+        })
+    ).then(function() {});
 }
 
 function handleSignal(data) {
+    if (!data || !data.signal) return;
+
     var fromSid = data.from;
     var signal = data.signal;
-    var pc = getOrCreateConnection(fromSid, false);
+
+    if (!fromSid || fromSid === mySid) {
+        return;
+    }
+
+    var pc =
+        getOrCreateConnection(
+            fromSid,
+            false
+        );
 
     if (!pc) return;
 
     if (signal.type === "offer") {
-        var offerCollision = (pc._makingOffer || pc.signalingState !== "stable");
-        pc._ignoreOffer = !pc._polite && offerCollision;
+        var offerCollision =
+            pc._makingOffer
+            || pc.signalingState !== "stable";
+
+        pc._ignoreOffer =
+            !pc._polite
+            && offerCollision;
+
         if (pc._ignoreOffer) {
-            log("Ignoring colliding offer (impolite)", "info");
             return;
         }
 
-        var doRollback = offerCollision && pc._polite;
-        var p = Promise.resolve();
-        if (doRollback) {
-            p = pc.setLocalDescription({ type: "rollback" }).catch(function(){});
+        var rollback =
+            offerCollision
+            && pc._polite;
+
+        var promise = Promise.resolve();
+
+        if (rollback) {
+            promise =
+                pc.setLocalDescription({
+                    type: "rollback"
+                }).catch(function() {});
         }
 
-        p.then(function() {
-            return pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        })
-        .then(function() {
-            while (pc.iceQueue.length) {
-                pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
-            }
-            return pc.createAnswer();
-        })
-        .then(function(ans) { return pc.setLocalDescription(ans); })
-        .then(function() {
-            socket.emit("signal", { to: fromSid, signal: { type: "answer", sdp: pc.localDescription } });
-        })
-        .catch(function(err) { log("Offer/answer err: " + err.message, "error"); });
-    } else if (signal.type === "answer") {
-        if (pc.signalingState !== "have-local-offer") {
-            return;
-        }
-        pc.setRemoteDescription(new RTCSessionDescription(signal.sdp))
+        promise
             .then(function() {
-                while (pc.iceQueue.length) {
-                    pc.addIceCandidate(pc.iceQueue.shift()).catch(function(){});
-                }
+                return pc.setRemoteDescription(
+                    signal.sdp
+                );
+            })
+            .then(function() {
+                return flushIceQueue(
+                    pc
+                );
+            })
+            .then(function() {
+                return pc.createAnswer();
+            })
+            .then(function(answer) {
+                return pc.setLocalDescription(
+                    answer
+                );
+            })
+            .then(function() {
+                if (!socket) return;
+
+                socket.emit(
+                    "signal",
+                    {
+                        to: fromSid,
+                        signal: {
+                            type: "answer",
+                            sdp: pc.localDescription
+                        }
+                    }
+                );
             })
             .catch(function(err) {
-                if (String(err.message || err).indexOf("stable") === -1) {
-                    log("Answer err: " + err.message, "error");
-                }
+                log(
+                    "Negotiation failed: "
+                    + (
+                        err.message || err
+                    ),
+                    "warn"
+                );
             });
-    } else if (signal.type === "ice") {
-        var candidate = new RTCIceCandidate(signal.candidate);
-        if (pc.remoteDescription && pc.remoteDescription.type) {
-            pc.addIceCandidate(candidate).catch(function(){});
-        } else {
-            pc.iceQueue.push(candidate);
+
+    } else if (signal.type === "answer") {
+        if (
+            pc.signalingState !==
+            "have-local-offer"
+        ) {
+            return;
         }
+
+        pc.setRemoteDescription(
+            signal.sdp
+        )
+            .then(function() {
+                return flushIceQueue(
+                    pc
+                );
+            })
+            .catch(function(err) {
+                log(
+                    "Answer failed: "
+                    + (
+                        err.message || err
+                    ),
+                    "warn"
+                );
+            });
+
+    } else if (signal.type === "ice") {
+        try {
+            var candidate =
+                new RTCIceCandidate(
+                    signal.candidate
+                );
+
+            if (
+                pc.remoteDescription
+                && pc.remoteDescription.type
+            ) {
+                pc.addIceCandidate(
+                    candidate
+                ).catch(function() {});
+            } else {
+                pc.iceQueue.push(
+                    candidate
+                );
+            }
+        } catch (e) {}
     }
 }
 
-function connectPeer(targetSid, force) {
+function connectPeer(
+    targetSid,
+    force
+) {
     if (!WEBRTC_SUPPORTED) {
-        if (force) log("WebRTC not supported, using relay only", "warn");
         return;
     }
-    if (isDataChannelOpen(targetSid) && !force) return;
 
-    var pc = getOrCreateConnection(targetSid, true);
-    pc._polite = (mySid < targetSid);
-    makeOffer(pc, targetSid);
+    if (
+        isDataChannelOpen(targetSid)
+        && !force
+    ) {
+        return;
+    }
+
+    var pc =
+        getOrCreateConnection(
+            targetSid,
+            true
+        );
+
+    if (!pc) return;
+
+    if (
+        pc.signalingState === "stable"
+    ) {
+        makeOffer(
+            pc,
+            targetSid
+        );
+    }
 }
 
-/* ---------- Send text / files ---------- */
+/* ---------- Text / file routing ---------- */
 
 function sendText() {
-    var text = document.getElementById("text-input").value.trim();
+    var input =
+        document.getElementById(
+            "text-input"
+        );
+
+    var text = input.value.trim();
+
     if (!text) return;
-    var targetSid = document.getElementById("peer-select").value;
+
+    var targetSid =
+        document.getElementById(
+            "peer-select"
+        ).value;
 
     if (targetSid) {
-        sendTextTo(targetSid, text);
+        sendTextTo(
+            targetSid,
+            text
+        );
     } else {
-        peerList.forEach(function(p) { sendTextTo(p.sid, text); });
+        peerList.forEach(function(p) {
+            sendTextTo(
+                p.sid,
+                text
+            );
+        });
     }
-    document.getElementById("text-input").value = "";
+
+    input.value = "";
 }
 
-function sendTextTo(targetSid, text) {
-    if (isDataChannelOpen(targetSid)) {
+function sendTextTo(
+    targetSid,
+    text
+) {
+    if (
+        isDataChannelOpen(targetSid)
+    ) {
         try {
-            connections[targetSid].dataChannel.send(JSON.stringify({ t: "txt", c: text }));
-            log("Sent text (P2P)", "p2p");
+            connections[
+                targetSid
+            ].dataChannel.send(
+                JSON.stringify({
+                    t: "txt",
+                    c: text
+                })
+            );
+
             return;
         } catch (e) {}
     }
-    var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
-    socket.emit("relay_text", { to: (pInfo ? pInfo.id : targetSid), text: text });
-    log("Sent text (Relay)", "info");
+
+    var pInfo = peerList.find(
+        function(x) {
+            return x.sid === targetSid;
+        }
+    );
+
+    if (!socket || !socket.connected) {
+        log(
+            "Text not sent: offline",
+            "error"
+        );
+        return;
+    }
+
+    socket.emit(
+        "relay_text",
+        {
+            to:
+                pInfo
+                    ? pInfo.id
+                    : targetSid,
+            text: text
+        }
+    );
 }
 
 function handleFileSelect(e) {
-    var files = e.target.files || (e.dataTransfer && e.dataTransfer.files);
-    if (!files || !files.length) return;
-    if (!peerList.length) {
-        showToast("No devices yet. Tap QR to invite one.");
-        log("No devices to send to", "warn");
+    var files =
+        e.target.files
+        || (
+            e.dataTransfer
+            && e.dataTransfer.files
+        );
+
+    if (!files || !files.length) {
         return;
     }
-    var targetSid = document.getElementById("peer-select").value;
-    var batchId = "b_" + generateTransferId();
-    var fileArr = Array.prototype.slice.call(files);
-    var total = fileArr.length;
 
-    fileArr.forEach(function(file, idx) {
+    if (!peerList.length) {
+        showToast(
+            "No devices yet. Tap QR to invite one."
+        );
+        return;
+    }
+
+    var targetSid =
+        document.getElementById(
+            "peer-select"
+        ).value;
+
+    var batchId =
+        "b_" + generateTransferId();
+
+    var fileArr =
+        Array.prototype.slice.call(
+            files
+        );
+
+    var total =
+        fileArr.length;
+
+    fileArr.forEach(function(
+        file,
+        index
+    ) {
         if (targetSid) {
-            sendFileTo(targetSid, file, batchId, total, idx);
+            sendFileTo(
+                targetSid,
+                file,
+                batchId,
+                total,
+                index
+            );
         } else {
-            peerList.forEach(function(p) { sendFileTo(p.sid, file, batchId, total, idx); });
+            peerList.forEach(function(p) {
+                sendFileTo(
+                    p.sid,
+                    file,
+                    batchId,
+                    total,
+                    index
+                );
+            });
         }
     });
-    document.getElementById("file-input").value = "";
-    if (total > 1) log("Queued batch of " + total + " files", "info");
+
+    document.getElementById(
+        "file-input"
+    ).value = "";
+
+    if (total > 1) {
+        log(
+            "Queued batch of "
+            + total
+            + " files",
+            "info"
+        );
+    }
 }
 
-function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
-    batchId = batchId || ("b_" + generateTransferId());
-    batchTotal = batchTotal || 1;
-    batchIndex = (typeof batchIndex === "number") ? batchIndex : 0;
-    var transferId = generateTransferId();
-    var pInfo = peerList.find(function(x) { return x.sid === targetSid; });
-    var targetPeerId = pInfo ? pInfo.id : targetSid;
+function sendFileTo(
+    targetSid,
+    file,
+    batchId,
+    batchTotal,
+    batchIndex
+) {
+    if (
+        !file
+        || !Number.isFinite(file.size)
+        || file.size <= 0
+    ) {
+        return;
+    }
+
+    if (
+        file.size
+        > 4 * 1024 * 1024 * 1024
+    ) {
+        showToast(
+            "File exceeds 4 GB limit"
+        );
+        return;
+    }
+
+    batchId =
+        batchId
+        || ("b_" + generateTransferId());
+
+    batchTotal =
+        batchTotal || 1;
+
+    batchIndex =
+        typeof batchIndex === "number"
+            ? batchIndex
+            : 0;
+
+    var transferId =
+        generateTransferId();
+
+    var pInfo = peerList.find(
+        function(x) {
+            return x.sid === targetSid;
+        }
+    );
+
+    var targetPeerId =
+        pInfo
+            ? pInfo.id
+            : targetSid;
+
     var meta = {
         file: file,
         transfer_id: transferId,
@@ -1795,317 +3281,1054 @@ function sendFileTo(targetSid, file, batchId, batchTotal, batchIndex) {
         target_peer_id: targetPeerId
     };
 
-    if (isDataChannelOpen(targetSid)) {
-        if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
-        pendingFileQueue[targetSid].push(meta);
-        if (pendingFileQueue[targetSid].length === 1) {
-            socket.emit("broadcast_request", {
-                to: targetPeerId,
-                file_name: file.name,
-                file_size: file.size,
-                file_type: file.type,
-                transfer_id: transferId,
-                batch_id: batchId,
-                batch_total: batchTotal,
-                batch_index: batchIndex
-            });
-        }
+    if (!pendingFileQueue[targetSid]) {
+        pendingFileQueue[targetSid] = [];
+    }
+
+    pendingFileQueue[targetSid].push(
+        meta
+    );
+
+    if (
+        isDataChannelOpen(targetSid)
+    ) {
+        startNextP2PTransfer(
+            targetSid
+        );
         return;
     }
 
-    connectPeer(targetSid, true);
-    if (!pendingFileQueue[targetSid]) pendingFileQueue[targetSid] = [];
-    pendingFileQueue[targetSid].push(meta);
+    connectPeer(
+        targetSid,
+        true
+    );
 
-    var waited = 0;
-    var check = setInterval(function() {
-        waited += 400;
-        if (isDataChannelOpen(targetSid)) {
-            clearInterval(check);
+    armP2PFallback(
+        targetSid
+    );
+}
+
+function armP2PFallback(targetSid) {
+    if (
+        p2pFallbackTimers[targetSid]
+    ) {
+        return;
+    }
+
+    p2pFallbackTimers[targetSid] =
+        setTimeout(function() {
+            delete p2pFallbackTimers[
+                targetSid
+            ];
+
+            if (
+                isDataChannelOpen(targetSid)
+            ) {
+                startNextP2PTransfer(
+                    targetSid
+                );
+                return;
+            }
+
+            fallbackPendingToRelay(
+                targetSid
+            );
+        }, P2P_CONNECT_TIMEOUT);
+}
+
+function fallbackPendingToRelay(
+    targetSid
+) {
+    var queue =
+        pendingFileQueue[targetSid];
+
+    if (
+        !queue
+        || !queue.length
+    ) {
+        return;
+    }
+
+    var copy = queue.splice(
+        0,
+        queue.length
+    );
+
+    if (!relayFileQueue[targetSid]) {
+        relayFileQueue[targetSid] = [];
+    }
+
+    Array.prototype.push.apply(
+        relayFileQueue[targetSid],
+        copy
+    );
+
+    setPeerConnState(
+        targetSid,
+        "relay"
+    );
+
+    processRelayQueue(
+        targetSid
+    );
+}
+
+function processRelayQueue(
+    targetSid
+) {
+    var queue =
+        relayFileQueue[targetSid];
+
+    if (!queue) return;
+
+    if (queue._active === undefined) {
+        queue._active = 0;
+    }
+
+    while (
+        queue._active < 3
+        && queue.length
+    ) {
+        var item = queue.shift();
+
+        queue._active++;
+
+        relaySendFile(
+            targetSid,
+            item.target_peer_id,
+            item.file,
+            item.transfer_id,
+            item.batch_id,
+            item.batch_total,
+            item.batch_index,
+            function() {
+                queue._active--;
+
+                processRelayQueue(
+                    targetSid
+                );
+            }
+        );
+    }
+}
+
+function waitForDataChannelDrain(
+    channel
+) {
+    return new Promise(function(resolve) {
+        if (
+            channel.readyState !== "open"
+            || channel.bufferedAmount
+                <= P2P_LOW_WATER
+        ) {
+            resolve();
             return;
         }
-        if (waited >= P2P_CONNECT_TIMEOUT) {
-            clearInterval(check);
-            var q = pendingFileQueue[targetSid];
-            if (q) {
-                var idx = q.findIndex(function(m) { return m.transfer_id === transferId; });
-                if (idx >= 0) {
-                    var item = q.splice(idx, 1)[0];
-                    if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
-                    relayFileQueue[targetSid].push(item);
-                    if (relayFileQueue[targetSid].length === 1 || (relayFileQueue[targetSid]._active || 0) < RELAY_BATCH_CONCURRENCY) {
-                        processRelayQueue(targetSid);
-                    }
-                }
-            }
-            setPeerConnState(targetSid, "relay");
-            log("P2P timeout, using Relay for " + file.name, "warn");
+
+        var settled = false;
+
+        function finish() {
+            if (settled) return;
+
+            settled = true;
+
+            try {
+                channel.removeEventListener(
+                    "bufferedamountlow",
+                    finish
+                );
+            } catch (e) {}
+
+            clearTimeout(timer);
+            resolve();
         }
-    }, 400);
+
+        channel.addEventListener(
+            "bufferedamountlow",
+            finish,
+            { once: true }
+        );
+
+        var timer = setTimeout(
+            finish,
+            120
+        );
+    });
 }
 
-function processRelayQueue(targetSid) {
-    var queue = relayFileQueue[targetSid];
-    if (!queue) return;
-    if (queue._active === undefined) queue._active = 0;
-    while (queue._active < RELAY_BATCH_CONCURRENCY && queue.length) {
-        var item = queue.shift();
-        queue._active++;
-        relaySendFile(targetSid, item.target_peer_id, item.file, item.transfer_id, item.batch_id, item.batch_total, item.batch_index, function() {
-            queue._active--;
-            processRelayQueue(targetSid);
-        });
-    }
-}
+async function startNextP2PTransfer(
+    targetSid
+) {
+    var queue =
+        pendingFileQueue[targetSid];
 
-function startDataTransfer(targetSid, transferId) {
-    var queue = pendingFileQueue[targetSid];
-    if (!queue || !queue.length) return;
-    var item = queue[0];
-    if (item.transfer_id !== transferId) return;
-
-    var file = item.file;
-    var pc = connections[targetSid];
-    if (!pc || !pc.dataChannel || pc.dataChannel.readyState !== "open") {
-        queue.shift();
-        if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
-        relayFileQueue[targetSid].push(item);
-        processRelayQueue(targetSid);
+    if (
+        !queue
+        || !queue.length
+    ) {
         return;
     }
+
+    var pc =
+        connections[targetSid];
+
+    if (
+        !pc
+        || !pc.dataChannel
+        || pc.dataChannel.readyState
+            !== "open"
+    ) {
+        return;
+    }
+
+    if (pc._sending) {
+        return;
+    }
+
+    pc._sending = true;
+
+    var item = queue[0];
+    var file = item.file;
     var channel = pc.dataChannel;
 
-    channel.send(JSON.stringify({
-        t: "fs",
-        n: file.name,
-        s: file.size,
-        m: file.type,
-        id: item.transfer_id,
-        bid: item.batch_id,
-        bt: item.batch_total,
-        bi: item.batch_index
-    }));
+    var totalBytes = file.size;
+    var totalChunks =
+        Math.ceil(
+            totalBytes
+            / P2P_CHUNK_SIZE
+        );
 
-    var reader = new FileReader();
-    reader.onload = function(e) {
-        var buffer = e.target.result;
-        var offset = 0;
-        document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "P2P " + file.name + (item.batch_total > 1 ? " (" + (item.batch_index + 1) + "/" + item.batch_total + ")" : "");
+    try {
+        channel.send(
+            JSON.stringify({
+                t: "fs",
+                n: file.name,
+                s: totalBytes,
+                m:
+                    file.type
+                    || "application/octet-stream",
+                id: item.transfer_id,
+                bid: item.batch_id,
+                bt: item.batch_total,
+                bi: item.batch_index,
+                tc: totalChunks
+            })
+        );
+
         activeTransfers++;
         updateTransferBadge();
 
-        function sendNext() {
-            if (offset >= buffer.byteLength) {
-                channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
-                log("Sent " + file.name + " (P2P)", "success");
-                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
-                activeTransfers--;
-                updateTransferBadge();
-                queue.shift();
-                if (queue.length) {
-                    var next = queue[0];
-                    socket.emit("broadcast_request", {
-                        to: item.target_peer_id,
-                        file_name: next.file.name,
-                        file_size: next.file.size,
-                        file_type: next.file.type,
-                        transfer_id: next.transfer_id,
-                        batch_id: next.batch_id,
-                        batch_total: next.batch_total,
-                        batch_index: next.batch_index
-                    });
-                }
-                return;
+        var offset = 0;
+
+        while (
+            offset < totalBytes
+            && channel.readyState === "open"
+        ) {
+            if (
+                channel.bufferedAmount
+                >= P2P_HIGH_WATER
+            ) {
+                await waitForDataChannelDrain(
+                    channel
+                );
             }
 
-            if (channel.bufferedAmount > CHUNK_SIZE * 12) {
-                var onLow = function() {
-                    channel.removeEventListener("bufferedamountlow", onLow);
-                    sendNext();
-                };
-                channel.addEventListener("bufferedamountlow", onLow);
-                setTimeout(function() {
-                    if (channel.bufferedAmount <= CHUNK_SIZE * 8) {
-                        channel.removeEventListener("bufferedamountlow", onLow);
-                        sendNext();
-                    }
-                }, 40);
-                return;
+            if (
+                channel.readyState !== "open"
+            ) {
+                throw new Error(
+                    "Data channel closed"
+                );
             }
 
-            var chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-            try {
-                channel.send(chunk);
-            } catch (err) {
-                log("Send chunk failed, falling back to relay", "error");
-                activeTransfers--;
-                updateTransferBadge();
-                queue.shift();
-                if (!relayFileQueue[targetSid]) relayFileQueue[targetSid] = [];
-                relayFileQueue[targetSid].unshift(item);
-                processRelayQueue(targetSid);
-                return;
-            }
-            offset += chunk.byteLength;
-            var pct = Math.min(100, Math.round((offset / buffer.byteLength) * 100));
-            document.getElementById("progress-fill").style.width = pct + "%";
-            document.getElementById("send-pct").textContent = pct + "%";
-            if (typeof requestAnimationFrame === "function") {
-                requestAnimationFrame(sendNext);
-            } else {
-                setTimeout(sendNext, 0);
-            }
+            var end = Math.min(
+                offset
+                + P2P_CHUNK_SIZE,
+                totalBytes
+            );
+
+            var buffer =
+                await file.slice(
+                    offset,
+                    end
+                ).arrayBuffer();
+
+            channel.send(buffer);
+
+            offset = end;
+
+            setProgress(
+                "P2P " + file.name,
+                offset,
+                totalBytes
+            );
         }
-        sendNext();
-    };
-    reader.readAsArrayBuffer(file);
+
+        if (
+            channel.readyState !== "open"
+        ) {
+            throw new Error(
+                "Data channel closed"
+            );
+        }
+
+        channel.send(
+            JSON.stringify({
+                t: "fe",
+                id: item.transfer_id
+            })
+        );
+
+        queue.shift();
+
+        activeTransfers--;
+        updateTransferBadge();
+        hideProgressSoon();
+
+        log(
+            "Sent " + file.name + " (P2P)",
+            "success"
+        );
+
+        pc._retryCount = 0;
+
+        setPeerConnState(
+            targetSid,
+            "p2p"
+        );
+
+    } catch (err) {
+        try {
+            if (
+                channel.readyState
+                === "open"
+            ) {
+                channel.send(
+                    JSON.stringify({
+                        t: "fa",
+                        id: item.transfer_id
+                    })
+                );
+            }
+        } catch (e) {}
+
+        if (queue[0] === item) {
+            queue.shift();
+        }
+
+        activeTransfers = Math.max(
+            0,
+            activeTransfers - 1
+        );
+        updateTransferBadge();
+
+        var relayItem = {
+            file: file,
+            transfer_id:
+                generateTransferId(),
+            batch_id:
+                item.batch_id,
+            batch_total:
+                item.batch_total,
+            batch_index:
+                item.batch_index,
+            target_peer_id:
+                item.target_peer_id
+        };
+
+        if (!relayFileQueue[targetSid]) {
+            relayFileQueue[targetSid] = [];
+        }
+
+        relayFileQueue[targetSid].unshift(
+            relayItem
+        );
+
+        setPeerConnState(
+            targetSid,
+            "relay"
+        );
+
+        log(
+            "P2P failed, resumed through relay: "
+            + file.name,
+            "warn"
+        );
+
+        processRelayQueue(
+            targetSid
+        );
+    } finally {
+        pc._sending = false;
+
+        if (
+            pendingFileQueue[targetSid]
+            && pendingFileQueue[targetSid].length
+            && isDataChannelOpen(targetSid)
+        ) {
+            queueMicrotask(function() {
+                startNextP2PTransfer(
+                    targetSid
+                );
+            });
+        }
+    }
 }
 
-function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batchTotal, batchIndex, onComplete) {
-    socket.emit("relay_file_start", {
-        to: targetPeerId,
-        file_name: file.name,
-        file_size: file.size,
-        file_type: file.type,
-        transfer_id: transferId,
-        batch_id: batchId || "",
-        batch_total: batchTotal || 1,
-        batch_index: batchIndex || 0
-    });
-    var reader = new FileReader();
-    reader.onerror = function() {
-        log("Failed to read " + file.name, "error");
+function startDataTransfer(
+    targetSid,
+    transferId
+) {
+    var queue =
+        pendingFileQueue[targetSid];
+
+    if (
+        queue
+        && queue.length
+        && (
+            !transferId
+            || queue[0].transfer_id
+                === transferId
+        )
+    ) {
+        startNextP2PTransfer(
+            targetSid
+        );
+    }
+}
+
+function relaySendFile(
+    targetSid,
+    targetPeerId,
+    file,
+    transferId,
+    batchId,
+    batchTotal,
+    batchIndex,
+    onComplete
+) {
+    if (
+        !socket
+        || !socket.connected
+    ) {
         if (onComplete) onComplete();
-    };
-    reader.onload = function(e) {
-        var bytes = new Uint8Array(e.target.result);
-        var total = bytes.length;
-        var offset = 0;
-        var inFlight = 0;
-        var MAX_IN_FLIGHT = 12;
-        var MAX_RETRIES = 8;
-        var aborted = false;
-        var sentBytes = 0;
-        var seqCounter = 0;
-        document.getElementById("progress-wrap").style.display = "block";
-        document.getElementById("send-status").textContent = "Relay " + file.name;
-        activeTransfers++;
+        return;
+    }
+
+    var chunkSize =
+        RELAY_CHUNK_SIZE;
+
+    var totalBytes =
+        file.size;
+
+    var totalChunks =
+        Math.ceil(
+            totalBytes
+            / chunkSize
+        );
+
+    socket.emit(
+        "relay_file_start",
+        {
+            to: targetPeerId,
+            transfer_id: transferId,
+            file_name: file.name,
+            file_size: totalBytes,
+            file_type:
+                file.type
+                || "application/octet-stream",
+            batch_id: batchId,
+            batch_total: batchTotal,
+            batch_index: batchIndex,
+            chunk_size: chunkSize,
+            total_chunks: totalChunks
+        }
+    );
+
+    activeTransfers++;
+    updateTransferBadge();
+
+    var offset = 0;
+    var nextSeq = 0;
+    var inFlight = 0;
+    var completedBytes = 0;
+    var settled = false;
+    var filling = false;
+    var pending = new Map();
+
+    function cleanup() {
+        pending.forEach(
+            function(entry) {
+                if (entry.timer) {
+                    clearTimeout(
+                        entry.timer
+                    );
+                }
+            }
+        );
+
+        pending.clear();
+    }
+
+    function finish(ok) {
+        if (settled) return;
+
+        settled = true;
+        cleanup();
+
+        if (ok) {
+            socket.emit(
+                "relay_file_done",
+                {
+                    to: targetPeerId,
+                    transfer_id:
+                        transferId,
+                    total_chunks:
+                        totalChunks
+                }
+            );
+
+            log(
+                "Sent " + file.name
+                + " (Relay)",
+                "success"
+            );
+        } else {
+            log(
+                "Relay failed: "
+                + file.name,
+                "error"
+            );
+        }
+
+        activeTransfers = Math.max(
+            0,
+            activeTransfers - 1
+        );
+
         updateTransferBadge();
+        hideProgressSoon();
 
-        function finishIfDone() {
-            if (!aborted && offset >= total && inFlight === 0) {
-                socket.emit("relay_file_done", { to: targetPeerId, transfer_id: transferId });
-                log("Sent " + file.name + " (Relay)", "success");
-                setTimeout(function() { document.getElementById("progress-wrap").style.display = "none"; }, 600);
-                activeTransfers--;
-                updateTransferBadge();
-                if (onComplete) onComplete();
-            }
+        if (onComplete) {
+            onComplete();
         }
+    }
 
-        function sendOneChunk(seq, b64, chunkLen) {
-            var attempts = 0;
-            function attempt() {
-                if (aborted) return;
-                socket.emit("relay_file_chunk", { to: targetPeerId, transfer_id: transferId, chunk: b64, seq: seq }, function(ack) {
-                    if (ack) {
-                        inFlight--;
-                        sentBytes += chunkLen;
-                        var pct = Math.min(100, Math.round((sentBytes / total) * 100));
-                        document.getElementById("progress-fill").style.width = pct + "%";
-                        document.getElementById("send-pct").textContent = pct + "%";
-                        pump();
-                        finishIfDone();
-                    } else if (attempts < MAX_RETRIES) {
-                        attempts++;
-                        setTimeout(attempt, 120 * attempts);
-                    } else {
-                        inFlight--;
-                        aborted = true;
-                        log("Giving up on " + file.name + " after repeated failures", "error");
-                        document.getElementById("progress-wrap").style.display = "none";
-                        activeTransfers--;
-                        updateTransferBadge();
-                        if (onComplete) onComplete();
+    function sendChunk(
+        seq,
+        buffer,
+        byteLength
+    ) {
+        var entry = {
+            buffer: buffer,
+            byteLength: byteLength,
+            attempts: 0,
+            timer: null,
+            acknowledged: false
+        };
+
+        pending.set(
+            seq,
+            entry
+        );
+
+        function attempt() {
+            if (settled) return;
+
+            entry.attempts++;
+
+            var completed = false;
+
+            if (entry.timer) {
+                clearTimeout(entry.timer);
+            }
+
+            entry.timer = setTimeout(
+                function() {
+                    if (completed || settled) {
+                        return;
                     }
-                });
-            }
-            attempt();
+
+                    completed = true;
+
+                    if (
+                        entry.attempts
+                        <= RELAY_MAX_RETRIES
+                    ) {
+                        setTimeout(
+                            attempt,
+                            Math.min(
+                                1500,
+                                RELAY_RETRY_BASE
+                                * Math.pow(
+                                    1.7,
+                                    entry.attempts - 1
+                                )
+                            )
+                        );
+                    } else {
+                        finish(false);
+                    }
+                },
+                9000
+            );
+
+            socket.emit(
+                "relay_file_chunk",
+                {
+                    to: targetPeerId,
+                    transfer_id:
+                        transferId,
+                    chunk: buffer,
+                    seq: seq
+                },
+                function(ack) {
+                    if (
+                        completed
+                        || settled
+                    ) {
+                        return;
+                    }
+
+                    completed = true;
+                    clearTimeout(
+                        entry.timer
+                    );
+                    entry.timer = null;
+
+                    if (!ack) {
+                        if (
+                            entry.attempts
+                            <= RELAY_MAX_RETRIES
+                        ) {
+                            setTimeout(
+                                attempt,
+                                Math.min(
+                                    1500,
+                                    RELAY_RETRY_BASE
+                                    * Math.pow(
+                                        1.7,
+                                        entry.attempts - 1
+                                    )
+                                )
+                            );
+                        } else {
+                            finish(false);
+                        }
+                        return;
+                    }
+
+                    pending.delete(seq);
+                    inFlight--;
+                    completedBytes +=
+                        byteLength;
+
+                    setProgress(
+                        "Relay " + file.name,
+                        completedBytes,
+                        totalBytes
+                    );
+
+                    pump();
+                }
+            );
         }
 
-        function pump() {
-            while (!aborted && inFlight < MAX_IN_FLIGHT && offset < total) {
-                var end = Math.min(offset + CHUNK_SIZE, total);
-                var chunk = bytes.subarray(offset, end);
-                var binary = "";
-                for (var i = 0; i < chunk.length; i++) binary += String.fromCharCode(chunk[i]);
-                var b64 = btoa(binary);
-                var chunkLen = end - offset;
-                offset = end;
-                inFlight++;
-                sendOneChunk(seqCounter++, b64, chunkLen);
-            }
+        attempt();
+    }
+
+    async function pump() {
+        if (
+            filling
+            || settled
+        ) {
+            return;
         }
-        pump();
-    };
-    reader.readAsArrayBuffer(file);
+
+        filling = true;
+
+        try {
+            while (
+                !settled
+                && inFlight < RELAY_WINDOW
+                && offset < totalBytes
+            ) {
+                var start = offset;
+                var end = Math.min(
+                    offset + chunkSize,
+                    totalBytes
+                );
+
+                offset = end;
+
+                var buffer =
+                    await file.slice(
+                        start,
+                        end
+                    ).arrayBuffer();
+
+                if (settled) {
+                    return;
+                }
+
+                var seq = nextSeq++;
+
+                inFlight++;
+
+                sendChunk(
+                    seq,
+                    buffer,
+                    buffer.byteLength
+                );
+            }
+        } catch (err) {
+            finish(false);
+        } finally {
+            filling = false;
+        }
+
+        if (
+            !settled
+            && offset >= totalBytes
+            && inFlight === 0
+        ) {
+            finish(true);
+        }
+    }
+
+    setProgress(
+        "Relay " + file.name,
+        0,
+        totalBytes
+    );
+
+    pump();
 }
 
-function handleDataMessage(data, fromSid) {
+/* ---------- P2P receive ---------- */
+
+function finalizeP2PReceive(
+    pc,
+    fromSid,
+    transferId
+) {
+    var transfer =
+        pc.receiveTransfers[
+            transferId
+        ];
+
+    if (!transfer) return;
+
+    var complete =
+        transfer.receivedBytes
+            === transfer.meta.s
+        && transfer.receivedChunks
+            === transfer.totalChunks;
+
+    if (!complete) {
+        delete pc.receiveTransfers[
+            transferId
+        ];
+
+        if (
+            pc.receiveTimers
+            && pc.receiveTimers[transferId]
+        ) {
+            clearTimeout(
+                pc.receiveTimers[transferId]
+            );
+            delete pc.receiveTimers[
+                transferId
+            ];
+        }
+
+        if (
+            pc.activeReceiveId
+            === transferId
+        ) {
+            pc.activeReceiveId = null;
+        }
+
+        log(
+            "P2P integrity failure for "
+            + transfer.meta.n,
+            "error"
+        );
+
+        return;
+    }
+
+    var blob = new Blob(
+        transfer.chunks,
+        {
+            type:
+                transfer.meta.m
+                || "application/octet-stream"
+        }
+    );
+
+    var url =
+        URL.createObjectURL(blob);
+
+    var sender =
+        peerList.find(function(p) {
+            return p.sid === fromSid;
+        });
+
+    addReceived(
+        "file",
+        {
+            name: transfer.meta.n,
+            size: transfer.meta.s,
+            url: url,
+            type: transfer.meta.m,
+            blob: blob,
+            batch_id:
+                transfer.meta.bid || "",
+            batch_total:
+                transfer.meta.bt || 1,
+            batch_index:
+                transfer.meta.bi || 0
+        },
+        sender
+            ? sender.name
+            : fromSid.slice(0, 6)
+    );
+
+    delete pc.receiveTransfers[
+        transferId
+    ];
+
+    if (
+        pc.activeReceiveId
+        === transferId
+    ) {
+        pc.activeReceiveId = null;
+    }
+
+    log(
+        "Received "
+        + transfer.meta.n
+        + " (P2P)",
+        "success"
+    );
+}
+
+function handleDataMessage(
+    data,
+    fromSid
+) {
+    var pc =
+        connections[fromSid];
+
+    if (!pc) return;
+
     if (typeof data === "string") {
         try {
             var msg = JSON.parse(data);
+
             if (msg.t === "txt") {
-                var name = (peerList.find(function(p){return p.sid===fromSid;}) || {}).name || fromSid.slice(0,6);
-                addReceived("text", msg.c, name);
+                var sender =
+                    peerList.find(
+                        function(p) {
+                            return p.sid === fromSid;
+                        }
+                    );
+
+                addReceived(
+                    "text",
+                    String(msg.c || ""),
+                    sender
+                        ? sender.name
+                        : fromSid.slice(0, 6)
+                );
+
             } else if (msg.t === "fs") {
-                var pc = connections[fromSid];
-                if (pc) {
-                    pc.activeMeta = msg;
-                    pc.receiveBuffer[msg.id] = [];
+                var total =
+                    Number(msg.s) || 0;
+
+                if (
+                    !msg.id
+                    || total <= 0
+                ) {
+                    return;
                 }
-            } else if (msg.t === "fe") {
-                var pc2 = connections[fromSid];
-                if (pc2 && pc2.receiveBuffer[msg.id] && pc2.activeMeta) {
-                    var buffers = pc2.receiveBuffer[msg.id];
-                    var blob = new Blob(buffers, { type: pc2.activeMeta.m });
-                    var url = URL.createObjectURL(blob);
-                    var senderName = (peerList.find(function(p){return p.sid===fromSid;}) || {}).name || fromSid.slice(0,6);
-                    addReceived("file", {
-                        name: pc2.activeMeta.n,
-                        size: pc2.activeMeta.s,
-                        url: url,
-                        type: pc2.activeMeta.m,
-                        blob: blob,
-                        batch_id: pc2.activeMeta.bid || "",
-                        batch_total: pc2.activeMeta.bt || 1,
-                        batch_index: pc2.activeMeta.bi || 0
-                    }, senderName);
-                    log("Received " + pc2.activeMeta.n + " (P2P)", "success");
-                    delete pc2.receiveBuffer[msg.id];
+
+                var totalChunks =
+                    Number(msg.tc)
+                    || Math.ceil(
+                        total
+                        / P2P_CHUNK_SIZE
+                    );
+
+                pc.receiveTransfers[
+                    msg.id
+                ] = {
+                    meta: msg,
+                    chunks: [],
+                    receivedBytes: 0,
+                    receivedChunks: 0,
+                    totalChunks: totalChunks
+                };
+
+                if (
+                    pc.receiveTimers
+                    && pc.receiveTimers[msg.id]
+                ) {
+                    clearTimeout(
+                        pc.receiveTimers[msg.id]
+                    );
+                }
+
+                pc.receiveTimers[msg.id] =
+                    setTimeout(
+                        function() {
+                            delete pc.receiveTransfers[
+                                msg.id
+                            ];
+
+                            if (
+                                pc.activeReceiveId
+                                === msg.id
+                            ) {
+                                pc.activeReceiveId =
+                                    null;
+                            }
+
+                            delete pc.receiveTimers[
+                                msg.id
+                            ];
+                        },
+                        10 * 60 * 1000
+                    );
+
+                pc.activeReceiveId =
+                    msg.id;
+
+            } else if (
+                msg.t === "fe"
+            ) {
+                finalizeP2PReceive(
+                    pc,
+                    fromSid,
+                    msg.id
+                );
+
+            } else if (
+                msg.t === "fa"
+            ) {
+                delete pc.receiveTransfers[
+                    msg.id
+                ];
+
+                if (
+                    pc.receiveTimers
+                    && pc.receiveTimers[msg.id]
+                ) {
+                    clearTimeout(
+                        pc.receiveTimers[msg.id]
+                    );
+                    delete pc.receiveTimers[
+                        msg.id
+                    ];
+                }
+
+                if (
+                    pc.activeReceiveId
+                    === msg.id
+                ) {
+                    pc.activeReceiveId = null;
                 }
             }
         } catch (e) {
-            log("Bad data message", "error");
+            log(
+                "Invalid P2P control message",
+                "error"
+            );
         }
-    } else {
-        var pc3 = connections[fromSid];
-        if (pc3 && pc3.activeMeta && pc3.receiveBuffer[pc3.activeMeta.id]) {
-            pc3.receiveBuffer[pc3.activeMeta.id].push(data);
-        }
+
+        return;
     }
+
+    var transferId =
+        pc.activeReceiveId;
+
+    if (!transferId) return;
+
+    var transfer =
+        pc.receiveTransfers[
+            transferId
+        ];
+
+    if (!transfer) return;
+
+    var buffer = null;
+
+    if (data instanceof ArrayBuffer) {
+        buffer = data;
+    } else if (
+        ArrayBuffer.isView(data)
+    ) {
+        buffer = data.buffer.slice(
+            data.byteOffset,
+            data.byteOffset
+                + data.byteLength
+        );
+    } else if (
+        data instanceof Blob
+    ) {
+        data.arrayBuffer().then(
+            function(bufferFromBlob) {
+                var current =
+                    pc.receiveTransfers[
+                        transferId
+                    ];
+
+                if (!current) return;
+
+                current.chunks.push(
+                    bufferFromBlob
+                );
+
+                current.receivedBytes +=
+                    bufferFromBlob.byteLength;
+
+                current.receivedChunks++;
+            }
+        ).catch(function() {});
+        return;
+    }
+
+    if (!buffer) return;
+
+    transfer.chunks.push(buffer);
+    transfer.receivedBytes +=
+        buffer.byteLength;
+    transfer.receivedChunks++;
 }
 
 function updateTransferBadge() {
-    var badge = document.getElementById("transfer-badge");
+    var badge =
+        document.getElementById(
+            "transfer-badge"
+        );
+
+    if (!badge) return;
+
     if (activeTransfers > 0) {
-        badge.style.display = "inline-block";
-        badge.textContent = "Transferring " + activeTransfers;
+        badge.style.display =
+            "inline-block";
+
+        badge.textContent =
+            "Transferring "
+            + activeTransfers;
     } else {
-        badge.style.display = "none";
+        badge.style.display =
+            "none";
     }
 }
+
+/* ---------- End adaptive transport core ---------- */
 
 /* ---------- Media helpers ---------- */
 
@@ -2272,7 +4495,7 @@ function ensureJpegPreview(item) {
         });
     }).then(function(jpegBlob) {
         item.jpegBlob = jpegBlob;
-        item.jpegUrl = URL.createObjectURL(jpegBlob);
+        item.jpegUrl = trackObjectUrl(URL.createObjectURL(jpegBlob));
         item.previewUrl = item.jpegUrl;
         item.convertedFromHeic = true;
         item.previewFailed = false;
@@ -3165,7 +5388,25 @@ dropZone.addEventListener("drop", function(e) {
     handleFileSelect({ target: { files: e.dataTransfer.files } });
 });
 
+var ownedObjectUrls = new Set();
+
+function trackObjectUrl(url) {
+    if (url) ownedObjectUrls.add(url);
+    return url;
+}
+
+function revokeTrackedObjectUrls() {
+    ownedObjectUrls.forEach(function(url) {
+        try {
+            URL.revokeObjectURL(url);
+        } catch (e) {}
+    });
+    ownedObjectUrls.clear();
+}
+
 window.addEventListener("beforeunload", function(e) {
+    revokeTrackedObjectUrls();
+
     if (activeTransfers > 0) {
         e.preventDefault();
         e.returnValue = "File transfer in progress. Leave anyway?";
