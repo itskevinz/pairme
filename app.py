@@ -15,7 +15,7 @@ from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 
 MAX_HTTP_BUFFER = 50 * 1024 * 1024
 MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024
@@ -24,7 +24,12 @@ MAX_CHUNK_BYTES = 256 * 1024
 STALE_TTL = 90
 CLEANUP_INTERVAL = 30
 
-MAX_TEXT_LEN = 20_000
+MAX_TEXT_BYTES = 8 * 1024 * 1024
+MAX_TEXT_CHARS = 8 * 1024 * 1024
+TEXT_CHUNK_CHARS = 12_000
+TEXT_DIRECT_MAX_CHARS = 24_000
+MAX_TEXT_CHUNKS = 1024
+TEXT_TRANSFER_TTL = 90
 MAX_NAME_LEN = 32
 MAX_FILE_NAME_LEN = 255
 MAX_FILE_TYPE_LEN = 127
@@ -34,6 +39,8 @@ MAX_BATCH_ID_LEN = 64
 RATE_LIMIT_WINDOW = 5.0
 RATE_LIMIT_MAX_EVENTS = 80
 FILECHUNK_RATE_BYTES = 128 * 1024 * 1024
+TEXTCHUNK_RATE_LIMIT = 2000
+TEXTCHUNK_RATE_WINDOW = 5.0
 
 ROOM_CODE_RE = re.compile(r"^\d{6}$")
 NAME_RE = re.compile(r"^[\w .\-]{1,32}$", re.UNICODE)
@@ -79,6 +86,7 @@ peer_last_name = {}
 
 rate_buckets = defaultdict(deque)
 rate_totals = defaultdict(int)
+relay_text_sessions = {}
 
 START_TIME = time.monotonic()
 
@@ -300,6 +308,14 @@ def cleanup_stale_peers():
         socketio.sleep(CLEANUP_INTERVAL)
 
         now = time.monotonic()
+
+        expired_text = [
+            key
+            for key, session in tuple(relay_text_sessions.items())
+            if session.get("expires_at", 0) <= now
+        ]
+        for key in expired_text:
+            relay_text_sessions.pop(key, None)
 
         stale = [
             sid
@@ -655,24 +671,188 @@ def handle_relay_text(data):
 
     sid = request.sid
     target_sid = resolve_target_sid(data.get("to"))
+    text = str(data.get("text", "") or "")
 
     if (
         target_sid in peers
         and target_sid != sid
         and _same_room(sid, target_sid)
+        and text
+        and len(text) <= TEXT_DIRECT_MAX_CHARS
+        and len(text.encode("utf-8")) <= TEXT_DIRECT_MAX_CHARS * 4
     ):
         emit(
             "relay_text",
             {
                 "from": sid,
                 "from_name": peers[sid]["name"],
-                "text": _clean_text(
-                    data.get("text", ""),
-                    MAX_TEXT_LEN,
-                ),
+                "text": text,
             },
             room=target_sid,
         )
+
+
+@socketio.on("relay_text_start")
+@guarded(weight=1, bucket="textstart")
+def handle_relay_text_start(data):
+    if not isinstance(data, dict):
+        return
+
+    sid = request.sid
+    target_sid = resolve_target_sid(data.get("to"))
+
+    if (
+        target_sid not in peers
+        or target_sid == sid
+        or not _same_room(sid, target_sid)
+    ):
+        return
+
+    transfer_id = _clean_text(
+        data.get("transfer_id"),
+        MAX_TRANSFER_ID_LEN,
+    )
+
+    total_chunks = _coerce_int(
+        data.get("total_chunks"),
+        minimum=1,
+        maximum=MAX_TEXT_CHUNKS,
+    )
+
+    total_chars = _coerce_int(
+        data.get("total_chars"),
+        minimum=1,
+        maximum=MAX_TEXT_CHARS,
+    )
+
+    if not transfer_id or not total_chunks or not total_chars:
+        return
+
+    relay_text_sessions[(sid, transfer_id)] = {
+        "target_sid": target_sid,
+        "total_chunks": total_chunks,
+        "total_chars": total_chars,
+        "received_chunks": 0,
+        "received_chars": 0,
+        "expires_at": time.monotonic() + TEXT_TRANSFER_TTL,
+    }
+
+    emit(
+        "relay_text_start",
+        {
+            "from": sid,
+            "from_name": peers[sid]["name"],
+            "transfer_id": transfer_id,
+            "total_chunks": total_chunks,
+            "total_chars": total_chars,
+        },
+        room=target_sid,
+    )
+
+
+@socketio.on("relay_text_chunk")
+@guarded(
+    weight=1,
+    bucket="textchunk",
+    limit=TEXTCHUNK_RATE_LIMIT,
+    window=TEXTCHUNK_RATE_WINDOW,
+)
+def handle_relay_text_chunk(data):
+    if not isinstance(data, dict):
+        return
+
+    sid = request.sid
+    transfer_id = _clean_text(
+        data.get("transfer_id"),
+        MAX_TRANSFER_ID_LEN,
+    )
+    session = relay_text_sessions.get((sid, transfer_id))
+
+    if not session:
+        return
+
+    if time.monotonic() > session["expires_at"]:
+        relay_text_sessions.pop((sid, transfer_id), None)
+        return
+
+    seq = _coerce_int(
+        data.get("seq"),
+        minimum=0,
+        maximum=session["total_chunks"] - 1,
+    )
+
+    chunk = data.get("chunk", "")
+
+    if not isinstance(chunk, str) or not chunk:
+        return
+
+    if len(chunk) > TEXT_CHUNK_CHARS:
+        return
+
+    if session["received_chunks"] >= session["total_chunks"]:
+        return
+
+    new_chars = session["received_chars"] + len(chunk)
+
+    if new_chars > session["total_chars"]:
+        relay_text_sessions.pop((sid, transfer_id), None)
+        return
+
+    session["received_chunks"] += 1
+    session["received_chars"] = new_chars
+
+    emit(
+        "relay_text_chunk",
+        {
+            "from": sid,
+            "transfer_id": transfer_id,
+            "seq": seq,
+            "chunk": chunk,
+        },
+        room=session["target_sid"],
+    )
+
+
+@socketio.on("relay_text_done")
+@guarded(weight=1, bucket="textdone")
+def handle_relay_text_done(data):
+    if not isinstance(data, dict):
+        return
+
+    sid = request.sid
+    transfer_id = _clean_text(
+        data.get("transfer_id"),
+        MAX_TRANSFER_ID_LEN,
+    )
+    session = relay_text_sessions.pop((sid, transfer_id), None)
+
+    if not session:
+        return
+
+    if (
+        session["received_chunks"] != session["total_chunks"]
+        or session["received_chars"] != session["total_chars"]
+    ):
+        emit(
+            "text_transfer_error",
+            {
+                "transfer_id": transfer_id,
+                "reason": "Incomplete text transfer",
+            },
+            room=sid,
+        )
+        return
+
+    emit(
+        "relay_text_done",
+        {
+            "from": sid,
+            "transfer_id": transfer_id,
+            "total_chunks": session["total_chunks"],
+            "total_chars": session["total_chars"],
+        },
+        room=session["target_sid"],
+    )
 
 
 @socketio.on("relay_file_start")
@@ -961,7 +1141,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .code-header { display: flex; justify-content: space-between; align-items: center; background: #1e293b; padding: 5px 10px; font-size: 11px; color: #94a3b8; font-family: ui-monospace, monospace; }
         .copy-btn { background: transparent; border: 1px solid #475569; color: #cbd5e1; border-radius: 5px; padding: 3px 8px; font-size: 10px; cursor: pointer; min-height: 0; }
         .copy-btn:active { background: #334155; }
-        .code-block { color: #f8fafc; padding: 10px; font-family: ui-monospace, Consolas, Monaco, monospace; font-size: 12px; line-height: 1.45; overflow-x: auto; max-height: 280px; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
+        .code-block { color: #f8fafc; padding: 10px; font-family: ui-monospace, Consolas, Monaco, monospace; font-size: 12px; line-height: 1.45; overflow: auto; max-height: 420px; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
         .inline-code { background: var(--accent-soft); color: var(--text); border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
         .expandable-block { position: relative; max-height: 220px; overflow: hidden; transition: max-height 0.2s ease; }
         .expandable-block.expanded { max-height: none !important; }
@@ -1259,7 +1439,14 @@ var relayMeta = {};
 var relayReceivedBytes = {};
 var relayReceivedCount = {};
 var relayCleanupTimers = {};
+var relayTextBuffers = {};
+var relayTextMeta = {};
+var relayTextTimers = {};
+var textSendChains = {};
 var textStore = {};
+var textStoreOrder = [];
+var textStoreBytes = 0;
+var MAX_TEXT_STORE_BYTES = 32 * 1024 * 1024;
 var batchStore = {};
 var mediaRegistry = {};
 var lightboxItems = [];
@@ -1273,6 +1460,10 @@ var P2P_HIGH_WATER = 1024 * 1024;
 var RELAY_WINDOW = 16;
 var RELAY_MAX_RETRIES = 7;
 var RELAY_RETRY_BASE = 80;
+var TEXT_CHUNK_CHARS = 12000;
+var TEXT_DIRECT_MAX_CHARS = 24000;
+var MAX_TEXT_BYTES = 8 * 1024 * 1024;
+var TEXT_TRANSFER_TIMEOUT = 90000;
 
 var STUN_SERVERS = {
     iceServers: [
@@ -1555,9 +1746,37 @@ function nativeShare() {
 
 /* ---------- Formatting ---------- */
 
+function rememberText(textId, text) {
+    if (Object.prototype.hasOwnProperty.call(textStore, textId)) {
+        textStoreBytes -= utf8ByteLength(textStore[textId]);
+        var oldPos = textStoreOrder.indexOf(textId);
+        if (oldPos >= 0) textStoreOrder.splice(oldPos, 1);
+    }
+
+    rememberText(textId, text);
+    textStoreOrder.push(textId);
+    textStoreBytes += utf8ByteLength(text);
+
+    while (textStoreBytes > MAX_TEXT_STORE_BYTES && textStoreOrder.length > 1) {
+        var oldest = textStoreOrder.shift();
+        if (!oldest || oldest === textId) continue;
+        textStoreBytes -= utf8ByteLength(textStore[oldest] || "");
+        delete textStore[oldest];
+    }
+}
+
+function clearTextRelayState(id) {
+    if (relayTextTimers[id]) {
+        clearTimeout(relayTextTimers[id]);
+        delete relayTextTimers[id];
+    }
+    delete relayTextBuffers[id];
+    delete relayTextMeta[id];
+}
+
 function renderFormattedContent(text, textId) {
     if (!text) return "";
-    textStore[textId] = text;
+    rememberText(textId, text);
     var codeBlocks = [];
     var inlineCodes = [];
     var placeholderText = text.replace(/```([\s\S]*?)```/g, function(match, code) {
@@ -2014,10 +2233,119 @@ function bindSocketEvents() {
     });
 
     socket.on("relay_text", function(data) {
+        if (!data || typeof data.text !== "string") return;
         addReceived(
             "text",
             data.text,
             data.from_name
+        );
+    });
+
+    socket.on("relay_text_start", function(data) {
+        var id = String(data && data.transfer_id || "");
+        var totalChunks = Number(data && data.total_chunks || 0);
+        var totalChars = Number(data && data.total_chars || 0);
+
+        if (
+            !id
+            || !Number.isInteger(totalChunks)
+            || totalChunks < 1
+            || totalChunks > 1024
+            || !Number.isInteger(totalChars)
+            || totalChars < 1
+            || totalChars > MAX_TEXT_BYTES
+        ) {
+            return;
+        }
+
+        clearTextRelayState(id);
+
+        relayTextBuffers[id] = new Array(totalChunks);
+        relayTextMeta[id] = {
+            sender: data.from_name || "Unknown",
+            totalChunks: totalChunks,
+            totalChars: totalChars,
+            received: 0,
+            receivedChars: 0
+        };
+
+        relayTextTimers[id] = setTimeout(
+            function() {
+                clearTextRelayState(id);
+            },
+            TEXT_TRANSFER_TIMEOUT
+        );
+    });
+
+    socket.on("relay_text_chunk", function(data) {
+        var id = String(data && data.transfer_id || "");
+        var meta = relayTextMeta[id];
+        var chunks = relayTextBuffers[id];
+
+        if (!meta || !chunks || !Array.isArray(chunks)) return;
+
+        var seq = Number(data.seq);
+        var chunk = data.chunk;
+
+        if (
+            !Number.isInteger(seq)
+            || seq < 0
+            || seq >= meta.totalChunks
+            || typeof chunk !== "string"
+            || !chunk
+            || chunk.length > TEXT_CHUNK_CHARS
+        ) {
+            return;
+        }
+
+        if (chunks[seq] !== undefined) return;
+
+        var nextChars = meta.receivedChars + chunk.length;
+
+        if (nextChars > meta.totalChars) {
+            clearTextRelayState(id);
+            return;
+        }
+
+        chunks[seq] = chunk;
+        meta.received++;
+        meta.receivedChars = nextChars;
+    });
+
+    socket.on("relay_text_done", function(data) {
+        var id = String(data && data.transfer_id || "");
+        var meta = relayTextMeta[id];
+        var chunks = relayTextBuffers[id];
+
+        if (!meta || !chunks) return;
+
+        if (
+            meta.received !== meta.totalChunks
+            || meta.receivedChars !== meta.totalChars
+        ) {
+            log("Text transfer incomplete", "error");
+            clearTextRelayState(id);
+            return;
+        }
+
+        var assembled = chunks.join("");
+
+        addReceived(
+            "text",
+            assembled,
+            meta.sender
+        );
+
+        clearTextRelayState(id);
+    });
+
+    socket.on("text_transfer_error", function(data) {
+        var id = String(data && data.transfer_id || "");
+        clearTextRelayState(id);
+        log(
+            "Text transfer failed: "
+            + String(data && data.reason || "unknown error"),
+            "error"
         );
     });
 
@@ -3068,29 +3396,49 @@ function connectPeer(
 
 /* ---------- Text / file routing ---------- */
 
-function sendText() {
-    var input =
-        document.getElementById(
-            "text-input"
+function utf8ByteLength(text) {
+    try {
+        return new TextEncoder().encode(text).byteLength;
+    } catch (e) {
+        return unescape(encodeURIComponent(text)).length;
+    }
+}
+
+function splitTextForTransport(text) {
+    var parts = [];
+
+    for (var i = 0; i < text.length; i += TEXT_CHUNK_CHARS) {
+        parts.push(
+            text.slice(i, i + TEXT_CHUNK_CHARS)
         );
+    }
 
-    var text = input.value.trim();
+    return parts;
+}
 
-    if (!text) return;
+function sendText() {
+    var input = document.getElementById("text-input");
+    var text = input.value;
 
-    var targetSid =
-        document.getElementById(
-            "peer-select"
-        ).value;
+    if (!text.trim()) return;
+
+    var size = utf8ByteLength(text);
+
+    if (size > MAX_TEXT_BYTES) {
+        showToast("Text is too large. Maximum is 8 MB.");
+        return;
+    }
+
+    var targetSid = document.getElementById("peer-select").value;
 
     if (targetSid) {
-        sendTextTo(
+        queueTextSend(
             targetSid,
             text
         );
     } else {
         peerList.forEach(function(p) {
-            sendTextTo(
+            queueTextSend(
                 p.sid,
                 text
             );
@@ -3100,49 +3448,142 @@ function sendText() {
     input.value = "";
 }
 
-function sendTextTo(
+function queueTextSend(targetSid, text) {
+    var chain = textSendChains[targetSid] || Promise.resolve();
+
+    textSendChains[targetSid] = chain
+        .then(function() {
+            return sendTextTo(
+                targetSid,
+                text
+            );
+        })
+        .catch(function() {
+            log("Text send failed", "error");
+        });
+}
+
+async function sendTextTo(
     targetSid,
     text
 ) {
-    if (
-        isDataChannelOpen(targetSid)
-    ) {
-        try {
-            connections[
-                targetSid
-            ].dataChannel.send(
-                JSON.stringify({
-                    t: "txt",
-                    c: text
-                })
-            );
+    var chunks = splitTextForTransport(text);
 
+    if (chunks.length === 1 && text.length <= TEXT_DIRECT_MAX_CHARS) {
+        if (isDataChannelOpen(targetSid)) {
+            try {
+                connections[targetSid].dataChannel.send(
+                    JSON.stringify({
+                        t: "txt",
+                        c: text
+                    })
+                );
+                return;
+            } catch (e) {}
+        }
+
+        var pInfo = peerList.find(function(x) {
+            return x.sid === targetSid;
+        });
+
+        if (socket && socket.connected) {
+            socket.emit(
+                "relay_text",
+                {
+                    to: pInfo ? pInfo.id : targetSid,
+                    text: text
+                }
+            );
             return;
-        } catch (e) {}
+        }
+
+        throw new Error("No transport available");
     }
 
-    var pInfo = peerList.find(
-        function(x) {
-            return x.sid === targetSid;
-        }
-    );
+    var transferId = generateTransferId();
 
-    if (!socket || !socket.connected) {
-        log(
-            "Text not sent: offline",
-            "error"
+    if (isDataChannelOpen(targetSid)) {
+        var channel = connections[targetSid].dataChannel;
+
+        channel.send(
+            JSON.stringify({
+                t: "txs",
+                id: transferId,
+                tc: chunks.length,
+                n: text.length
+            })
         );
+
+        for (var i = 0; i < chunks.length; i++) {
+            if (channel.readyState !== "open") {
+                throw new Error("Data channel closed");
+            }
+
+            if (channel.bufferedAmount >= P2P_HIGH_WATER) {
+                await waitForDataChannelDrain(channel);
+            }
+
+            channel.send(
+                JSON.stringify({
+                    t: "txc",
+                    id: transferId,
+                    q: i,
+                    c: chunks[i]
+                })
+            );
+        }
+
+        channel.send(
+            JSON.stringify({
+                t: "txe",
+                id: transferId
+            })
+        );
+
         return;
     }
 
+    var pInfo = peerList.find(function(x) {
+        return x.sid === targetSid;
+    });
+
+    if (!socket || !socket.connected) {
+        throw new Error("No transport available");
+    }
+
     socket.emit(
-        "relay_text",
+        "relay_text_start",
         {
-            to:
-                pInfo
-                    ? pInfo.id
-                    : targetSid,
-            text: text
+            to: pInfo ? pInfo.id : targetSid,
+            transfer_id: transferId,
+            total_chunks: chunks.length,
+            total_chars: text.length
+        }
+    );
+
+    for (var j = 0; j < chunks.length; j++) {
+        socket.emit(
+            "relay_text_chunk",
+            {
+                to: pInfo ? pInfo.id : targetSid,
+                transfer_id: transferId,
+                seq: j,
+                chunk: chunks[j]
+            }
+        );
+
+        if ((j & 31) === 31) {
+            await new Promise(function(resolve) {
+                setTimeout(resolve, 0);
+            });
+        }
+    }
+
+    socket.emit(
+        "relay_text_done",
+        {
+            to: pInfo ? pInfo.id : targetSid,
+            transfer_id: transferId
         }
     );
 }
@@ -4140,6 +4581,102 @@ function handleDataMessage(
                     String(msg.c || ""),
                     sender
                         ? sender.name
+                        : fromSid.slice(0, 6)
+                );
+
+            } else if (msg.t === "txs") {
+                var textId = String(msg.id || "");
+                var textTotal = Number(msg.n) || 0;
+                var textChunks = Number(msg.tc) || 0;
+
+                if (
+                    !textId
+                    || !textTotal
+                    || textTotal > MAX_TEXT_BYTES
+                    || !textChunks
+                    || textChunks > 1024
+                ) {
+                    return;
+                }
+
+                if (pc.textTransfers && pc.textTransfers[textId]) {
+                    delete pc.textTransfers[textId];
+                }
+
+                pc.textTransfers = pc.textTransfers || {};
+                pc.textTransfers[textId] = {
+                    chunks: new Array(textChunks),
+                    totalChunks: textChunks,
+                    totalChars: textTotal,
+                    receivedChunks: 0,
+                    receivedChars: 0,
+                    timer: setTimeout(function() {
+                        if (pc.textTransfers) {
+                            delete pc.textTransfers[textId];
+                        }
+                    }, TEXT_TRANSFER_TIMEOUT)
+                };
+
+            } else if (msg.t === "txc") {
+                var current = pc.textTransfers && pc.textTransfers[String(msg.id || "")];
+                if (!current) return;
+
+                var seq = Number(msg.q);
+                var chunk = typeof msg.c === "string" ? msg.c : "";
+
+                if (
+                    !Number.isInteger(seq)
+                    || seq < 0
+                    || seq >= current.totalChunks
+                    || !chunk
+                    || chunk.length > TEXT_CHUNK_CHARS
+                    || current.chunks[seq] !== undefined
+                ) {
+                    return;
+                }
+
+                var receivedChars =
+                    current.receivedChars + chunk.length;
+
+                if (receivedChars > current.totalChars) {
+                    clearTimeout(current.timer);
+                    delete pc.textTransfers[String(msg.id || "")];
+                    return;
+                }
+
+                current.chunks[seq] = chunk;
+                current.receivedChunks++;
+                current.receivedChars = receivedChars;
+
+            } else if (msg.t === "txe") {
+                var transfer = pc.textTransfers && pc.textTransfers[String(msg.id || "")];
+                if (!transfer) return;
+
+                if (
+                    transfer.receivedChunks !== transfer.totalChunks
+                    || transfer.receivedChars !== transfer.totalChars
+                ) {
+                    clearTimeout(transfer.timer);
+                    delete pc.textTransfers[String(msg.id || "")];
+                    log("P2P text transfer incomplete", "error");
+                    return;
+                }
+
+                var assembledText = transfer.chunks.join("");
+                clearTimeout(transfer.timer);
+                delete pc.textTransfers[String(msg.id || "")];
+
+                var textSender = peerList.find(
+                    function(p) {
+                        return p.sid === fromSid;
+                    }
+                );
+
+                addReceived(
+                    "text",
+                    assembledText,
+                    textSender
+                        ? textSender.name
                         : fromSid.slice(0, 6)
                 );
 
