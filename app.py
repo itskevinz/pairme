@@ -18,7 +18,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 SECRET = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
 
 app = Flask(__name__)
@@ -742,6 +742,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .toast { position: fixed; left: 50%; bottom: max(20px, env(safe-area-inset-bottom)); transform: translateX(-50%) translateY(20px); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 12px; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity 0.2s, transform 0.2s; z-index: 300; }
         .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+        .stage-tray { border: 1px solid var(--border); border-radius: 10px; background: var(--accent-soft); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+        .stage-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 6px; }
+        .stage-item { position: relative; aspect-ratio: 1; border-radius: 8px; overflow: hidden; background: #0f172a; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: #cbd5e1; font-size: 10px; font-weight: 700; text-align: center; padding: 4px; }
+        .stage-item img { width: 100%; height: 100%; object-fit: cover; position: absolute; inset: 0; }
+        .stage-remove { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; min-height: 0; padding: 0; border-radius: 50%; background: rgba(15,23,42,0.75); border: none; color: #fff; font-size: 13px; line-height: 1; z-index: 2; }
+        .stage-actions { display: flex; gap: 6px; align-items: center; justify-content: space-between; font-size: 11px; color: var(--muted); }
+        .feed-right { display: inline-flex; align-items: center; gap: 8px; }
+        .feed-remove { min-height: 0; width: 22px; height: 22px; padding: 0; border-radius: 6px; background: transparent; color: var(--muted); border: 1px solid var(--border); font-size: 14px; line-height: 1; }
+        .drop-overlay { display: none; position: fixed; inset: 10px; z-index: 250; border: 3px dashed var(--text); border-radius: 16px; background: rgba(15,23,42,0.55); color: #fff; font-size: 18px; font-weight: 700; align-items: center; justify-content: center; pointer-events: none; }
+        .drop-overlay.show { display: flex; }
+
         @media (max-width: 768px) {
             body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
@@ -812,6 +823,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
                     </button>
                 </div>
+                <label class="zip-opt" style="margin-right:0;"><input type="checkbox" id="notify-toggle" checked onchange="toggleNotify(this.checked)"> Sound and notifications</label>
                 <div class="card-header" style="margin:8px -12px 0 -12px;border-top:1px solid var(--border);">Nearby</div>
                 <div id="peer-list" style="display:flex;flex-direction:column;gap:6px;">
                     <div class="empty-hint">No devices detected</div>
@@ -837,10 +849,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
                     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                    <span>Tap or drag files / photos here</span>
+                    <span>Tap, drag, or press Ctrl+V to paste</span>
                     <span style="font-size:11px;color:var(--muted2);">Live Photo: select both the HEIC and MOV files</span>
                     <input type="file" id="file-input" multiple accept="*/*" style="display:none;" onchange="handleFileSelect(event)">
                 </div>
+                <div class="row">
+                    <button class="flat flex-1" onclick="readClipboardButton()">Paste from clipboard</button>
+                    <button class="flat flex-1" id="camera-btn" onclick="document.getElementById('camera-input').click()">Camera</button>
+                    <input type="file" id="camera-input" accept="image/*,video/*" capture="environment" style="display:none;" onchange="handleFileSelect(event)">
+                </div>
+                <div id="stage-tray" class="stage-tray" style="display:none;"></div>
                 <div id="progress-wrap" style="display:none;">
                     <div class="row" style="justify-content:space-between;font-size:11px;color:var(--muted);">
                         <span id="send-status">Sending</span>
@@ -848,7 +866,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                     <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
                 </div>
-                <div class="card-header" style="margin:0 -12px;">Received</div>
+                <div class="card-header" style="margin:0 -12px;"><span>Received</span><button class="action-btn" onclick="clearReceived()">Clear all</button></div>
                 <ul class="feed-list" id="received-list"></ul>
             </div>
         </div>
@@ -907,6 +925,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="lightbox-bottom" id="lightbox-bottom"></div>
     </div>
     <div class="toast" id="toast"></div>
+    <div class="drop-overlay" id="drop-overlay">Drop files to send</div>
 <script>
 var socket = null;
 var mySid = "";
@@ -945,6 +964,14 @@ var p2pDraining = {};
 var p2pWaiters = {};
 var lastProgressPaint = 0;
 var memoryUid = null;
+var TEXT_INLINE_LIMIT = 19000;
+var stagedFiles = [];
+var unreadCount = 0;
+var BASE_TITLE = document.title;
+var notifyEnabled = localStorage.getItem("pairme_notify") !== "0";
+var audioCtx = null;
+var dragDepth = 0;
+var transferClock = { start: 0, total: 0 };
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
@@ -1254,6 +1281,223 @@ function checkAutoExpand(blockId, overlayId) {
 
 function generateTransferId() {
     return Date.now() + "_" + Math.floor(Math.random() * 100000);
+}
+
+function timeStamp() {
+    var d = new Date();
+    function p(n) { return ("0" + n).slice(-2); }
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+function formatEta(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return "";
+    if (seconds < 60) return Math.ceil(seconds) + "s";
+    return Math.floor(seconds / 60) + "m " + Math.ceil(seconds % 60) + "s";
+}
+
+function extFromType(type) {
+    var map = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif", "image/bmp": "bmp", "image/avif": "avif", "image/heic": "heic" };
+    return map[type] || "bin";
+}
+
+function normalizePastedFile(file, index) {
+    var generic = !file.name || /^(image|clip|blob)(\.[a-z0-9]+)?$/i.test(file.name);
+    if (!generic) return file;
+    var suffix = index ? "-" + (index + 1) : "";
+    return new File([file], "pasted-" + timeStamp() + suffix + "." + extFromType(file.type), { type: file.type });
+}
+
+function stageFiles(files) {
+    files.forEach(function(file) {
+        var named = normalizePastedFile(file, stagedFiles.length);
+        stagedFiles.push({ file: named, url: isImageType(named.type) ? URL.createObjectURL(named) : "" });
+    });
+    renderStageTray();
+    if (window.innerWidth <= 768) switchTab("transfer");
+    showToast(stagedFiles.length + " ready. Press Enter to send");
+}
+
+function unstageFile(index) {
+    var entry = stagedFiles[index];
+    if (!entry) return;
+    if (entry.url) URL.revokeObjectURL(entry.url);
+    stagedFiles.splice(index, 1);
+    renderStageTray();
+}
+
+function clearStaged() {
+    stagedFiles.forEach(function(entry) {
+        if (entry.url) URL.revokeObjectURL(entry.url);
+    });
+    stagedFiles = [];
+    renderStageTray();
+}
+
+function sendStaged() {
+    if (!stagedFiles.length) return;
+    if (!peerList.length) {
+        showToast("No devices yet. Tap QR to invite one.");
+        return;
+    }
+    var files = stagedFiles.map(function(entry) { return entry.file; });
+    clearStaged();
+    sendFiles(files);
+}
+
+function renderStageTray() {
+    var tray = document.getElementById("stage-tray");
+    if (!stagedFiles.length) {
+        tray.style.display = "none";
+        tray.innerHTML = "";
+        return;
+    }
+    var total = stagedFiles.reduce(function(sum, entry) { return sum + entry.file.size; }, 0);
+    var html = '<div class="stage-list">';
+    stagedFiles.forEach(function(entry, i) {
+        html += '<div class="stage-item" title="' + escapeHtml(entry.file.name) + '">' +
+            (entry.url ? '<img src="' + entry.url + '" alt="">' : '<span>' + escapeHtml(fileExtLabel(entry.file.name, entry.file.type)) + '</span>') +
+            '<button type="button" class="stage-remove" aria-label="Remove" onclick="unstageFile(' + i + ')">&times;</button>' +
+        '</div>';
+    });
+    html += '</div><div class="stage-actions"><span>' + stagedFiles.length + ' ready · ' + formatBytes(total) + '</span>' +
+        '<span class="row"><button type="button" class="action-btn" onclick="clearStaged()">Clear</button>' +
+        '<button type="button" class="action-btn primary" onclick="sendStaged()">Send</button></span></div>';
+    tray.innerHTML = html;
+    tray.style.display = "flex";
+}
+
+function applyClipboardText(text) {
+    var input = document.getElementById("text-input");
+    input.value = input.value ? input.value + "\n" + text : text;
+    input.focus();
+}
+
+function readClipboardButton() {
+    if (!navigator.clipboard) {
+        showToast("Clipboard not available");
+        return;
+    }
+    if (!navigator.clipboard.read) {
+        navigator.clipboard.readText().then(applyClipboardText).catch(function() {
+            showToast("Clipboard permission denied");
+        });
+        return;
+    }
+    navigator.clipboard.read().then(function(items) {
+        return Promise.all(items.map(function(item) {
+            var imageType = item.types.filter(function(t) { return t.indexOf("image/") === 0; })[0];
+            if (imageType) {
+                return item.getType(imageType).then(function(blob) {
+                    return { file: new File([blob], "image", { type: imageType }) };
+                });
+            }
+            if (item.types.indexOf("text/plain") >= 0) {
+                return item.getType("text/plain").then(function(blob) { return blob.text(); }).then(function(text) {
+                    return { text: text };
+                });
+            }
+            return null;
+        }));
+    }).then(function(results) {
+        var files = [];
+        var text = "";
+        results.forEach(function(r) {
+            if (!r) return;
+            if (r.file) files.push(r.file);
+            else if (r.text) text += r.text;
+        });
+        if (files.length) stageFiles(files);
+        if (text) applyClipboardText(text);
+        if (!files.length && !text) showToast("Clipboard is empty");
+    }).catch(function() {
+        showToast("Clipboard permission denied");
+    });
+}
+
+function releaseItem(item) {
+    [item.url, item.jpegUrl].forEach(function(u) {
+        if (u) {
+            try { URL.revokeObjectURL(u); } catch (e) {}
+        }
+    });
+    if (item._mediaId) delete mediaRegistry[item._mediaId];
+}
+
+function removeFeedItem(li) {
+    var items = li._getItems ? li._getItems() : [];
+    items.forEach(releaseItem);
+    if (li.dataset.textId) delete textStore[li.dataset.textId];
+    var batchId = li.dataset.batchId;
+    if (batchId && batchStore[batchId]) {
+        var batch = batchStore[batchId];
+        if (batch.renderTimer) clearTimeout(batch.renderTimer);
+        (batch.unitIds || []).forEach(function(id) { delete unitRegistry[id]; });
+        delete batchStore[batchId];
+    }
+    if (li.parentNode) li.parentNode.removeChild(li);
+}
+
+function clearReceived() {
+    var list = document.getElementById("received-list");
+    Array.prototype.slice.call(list.children).forEach(removeFeedItem);
+}
+
+function decorateFeedItem(li, getItems) {
+    var header = li.querySelector(".feed-header");
+    var time = li.querySelector(".feed-time");
+    if (!header || !time) return;
+    var wrap = document.createElement("span");
+    wrap.className = "feed-right";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "feed-remove";
+    btn.setAttribute("aria-label", "Remove");
+    btn.innerHTML = "&times;";
+    btn.onclick = function() { removeFeedItem(li); };
+    header.replaceChild(wrap, time);
+    wrap.appendChild(time);
+    wrap.appendChild(btn);
+    li._getItems = getItems;
+}
+
+function playPing() {
+    try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        audioCtx = audioCtx || new AC();
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        var now = audioCtx.currentTime;
+        var osc = audioCtx.createOscillator();
+        var gain = audioCtx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.exponentialRampToValueAtTime(1320, now + 0.12);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.12, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now);
+        osc.stop(now + 0.25);
+    } catch (e) {}
+}
+
+function toggleNotify(on) {
+    notifyEnabled = !!on;
+    localStorage.setItem("pairme_notify", on ? "1" : "0");
+    if (on && window.Notification && Notification.permission === "default") {
+        try { Notification.requestPermission(); } catch (e) {}
+    }
+}
+
+function notifyIncoming(sender, label) {
+    if (notifyEnabled) playPing();
+    if (!document.hidden) return;
+    unreadCount++;
+    document.title = "(" + unreadCount + ") " + BASE_TITLE;
+    if (notifyEnabled && window.Notification && Notification.permission === "granted") {
+        try { new Notification("PairMe", { body: sender + ": " + label, tag: "pairme" }); } catch (e) {}
+    }
 }
 
 function randomHex(byteCount) {
@@ -1728,8 +1972,14 @@ function connectPeer(targetSid, force) {
 }
 
 function sendText() {
-    var text = document.getElementById("text-input").value.trim();
+    var input = document.getElementById("text-input");
+    var text = input.value.trim();
     if (!text) return;
+    if (text.length > TEXT_INLINE_LIMIT) {
+        sendFiles([new File([text], "message-" + timeStamp() + ".txt", { type: "text/plain" })]);
+        input.value = "";
+        return;
+    }
     var targetSid = document.getElementById("peer-select").value;
 
     if (targetSid) {
@@ -1737,7 +1987,7 @@ function sendText() {
     } else {
         peerList.forEach(function(p) { sendTextTo(p.sid, text); });
     }
-    document.getElementById("text-input").value = "";
+    input.value = "";
 }
 
 function sendTextTo(targetSid, text) {
@@ -1753,9 +2003,8 @@ function sendTextTo(targetSid, text) {
     log("Sent text (Relay)", "info");
 }
 
-function handleFileSelect(e) {
-    var files = e.target.files || (e.dataTransfer && e.dataTransfer.files);
-    if (!files || !files.length) return;
+function sendFiles(fileArr) {
+    if (!fileArr.length) return;
     if (!peerList.length) {
         showToast("No devices yet. Tap QR to invite one.");
         log("No devices to send to", "warn");
@@ -1763,7 +2012,6 @@ function handleFileSelect(e) {
     }
     var targetSid = document.getElementById("peer-select").value;
     var batchId = "b_" + generateTransferId();
-    var fileArr = Array.prototype.slice.call(files);
     var total = fileArr.length;
 
     fileArr.forEach(function(file, idx) {
@@ -1773,8 +2021,15 @@ function handleFileSelect(e) {
             peerList.forEach(function(p) { sendFileTo(p.sid, file, batchId, total, idx); });
         }
     });
-    document.getElementById("file-input").value = "";
     if (total > 1) log("Queued batch of " + total + " files", "info");
+}
+
+function handleFileSelect(e) {
+    var files = e.target.files || (e.dataTransfer && e.dataTransfer.files);
+    if (!files || !files.length) return;
+    var fileArr = Array.prototype.slice.call(files);
+    if (e.target && "value" in e.target) e.target.value = "";
+    sendFiles(fileArr);
 }
 
 function readBlobBuffer(blob) {
@@ -1791,15 +2046,25 @@ function setProgress(pct) {
     var now = performance.now();
     if (pct < 100 && now - lastProgressPaint < 80) return;
     lastProgressPaint = now;
+    var detail = "";
+    if (transferClock.total && pct > 0 && pct < 100) {
+        var elapsed = (now - transferClock.start) / 1000;
+        if (elapsed > 0.4) {
+            var done = transferClock.total * pct / 100;
+            var speed = done / elapsed;
+            detail = " · " + formatBytes(speed) + "/s · " + formatEta((transferClock.total - done) / speed);
+        }
+    }
     document.getElementById("progress-fill").style.width = pct.toFixed(1) + "%";
-    document.getElementById("send-pct").textContent = Math.round(pct) + "%";
+    document.getElementById("send-pct").textContent = Math.round(pct) + "%" + detail;
 }
 
-function beginTransfer(label) {
+function beginTransfer(label, totalBytes) {
     activeTransfers++;
     updateTransferBadge();
     document.getElementById("progress-wrap").style.display = "block";
     document.getElementById("send-status").textContent = label;
+    transferClock = { start: performance.now(), total: totalBytes || 0 };
     lastProgressPaint = 0;
     setProgress(0);
 }
@@ -1934,7 +2199,7 @@ function sendFileOverChannel(pc, item) {
         bt: item.batch_total,
         bi: item.batch_index
     }));
-    beginTransfer("P2P " + file.name + batchLabel(item));
+    beginTransfer("P2P " + file.name + batchLabel(item), file.size);
     return pumpFileToChannel(channel, file, getP2PChunkSize(pc), setProgress).then(function() {
         channel.send(JSON.stringify({ t: "fe", id: item.transfer_id }));
         endTransfer();
@@ -2038,7 +2303,7 @@ function relaySendFile(targetSid, targetPeerId, file, transferId, batchId, batch
         batch_total: batchTotal || 1,
         batch_index: batchIndex || 0
     });
-    beginTransfer("Relay " + file.name + batchLabel({ batch_total: batchTotal || 1, batch_index: batchIndex || 0 }));
+    beginTransfer("Relay " + file.name + batchLabel({ batch_total: batchTotal || 1, batch_index: batchIndex || 0 }), file.size);
 
     var offset = 0;
     var seq = 0;
@@ -2703,6 +2968,7 @@ function ensureBatchCard(batchId, sender, total) {
             '<button class="action-btn primary" onclick="downloadBatchZip(\'' + batchId + '\')">Download ZIP</button>' +
         '</div>';
     list.insertBefore(li, list.firstChild);
+    decorateFeedItem(li, function() { return batchStore[batchId] ? batchStore[batchId].items : []; });
     batchStore[batchId] = {
         sender: sender,
         items: [],
@@ -2882,6 +3148,7 @@ function addToBatch(batchId, item, sender) {
                 batch.renderTimer = null;
             }
             renderBatchBody(batchId);
+            notifyIncoming(sender, done + " file" + (done > 1 ? "s" : ""));
             document.getElementById("batch-actions-" + batchId).style.display = "flex";
         } else {
             metaEl.textContent = "Receiving " + done + " / " + total + "...";
@@ -2920,6 +3187,9 @@ function addReceived(type, data, sender) {
                 '<button class="action-btn" onclick="copyFullText(\'' + textId + '\', this)">Copy All</button>' +
             '</div>';
         list.insertBefore(li, list.firstChild);
+        li.dataset.textId = textId;
+        decorateFeedItem(li, function() { return []; });
+        notifyIncoming(sender, String(data).slice(0, 80));
         checkAutoExpand(blockId, overlayId);
         return;
     }
@@ -2974,6 +3244,8 @@ function addReceived(type, data, sender) {
                 '<span class="dl-slot">' + dlMenuHtml(unitId, unit) + '</span>' +
             '</div>' + previewHtml;
         list.insertBefore(li, list.firstChild);
+        decorateFeedItem(li, function() { return [item]; });
+        notifyIncoming(sender, item.name);
     });
 }
 
@@ -3229,18 +3501,73 @@ function respondRequest(accepted) {
     }
 }
 
-var dropZone = document.getElementById("drop-zone");
-dropZone.addEventListener("dragover", function(e) {
+function dragHasFiles(e) {
+    return !!(e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") >= 0);
+}
+
+window.addEventListener("dragenter", function(e) {
+    if (!dragHasFiles(e)) return;
     e.preventDefault();
-    dropZone.classList.add("dragover");
+    dragDepth++;
+    document.getElementById("drop-overlay").classList.add("show");
 });
-dropZone.addEventListener("dragleave", function() {
-    dropZone.classList.remove("dragover");
+
+window.addEventListener("dragover", function(e) {
+    if (dragHasFiles(e)) e.preventDefault();
 });
-dropZone.addEventListener("drop", function(e) {
+
+window.addEventListener("dragleave", function(e) {
+    if (!dragHasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) document.getElementById("drop-overlay").classList.remove("show");
+});
+
+window.addEventListener("drop", function(e) {
+    if (!dragHasFiles(e)) return;
     e.preventDefault();
-    dropZone.classList.remove("dragover");
-    handleFileSelect({ target: { files: e.dataTransfer.files } });
+    dragDepth = 0;
+    document.getElementById("drop-overlay").classList.remove("show");
+    sendFiles(Array.prototype.slice.call(e.dataTransfer.files));
+});
+
+document.addEventListener("paste", function(e) {
+    if (document.getElementById("lightbox").classList.contains("open")) return;
+    var data = e.clipboardData;
+    if (!data) return;
+    var files = Array.prototype.slice.call(data.files || []);
+    if (!files.length && data.items) {
+        Array.prototype.forEach.call(data.items, function(item) {
+            if (item.kind === "file") {
+                var f = item.getAsFile();
+                if (f) files.push(f);
+            }
+        });
+    }
+    if (files.length) {
+        e.preventDefault();
+        stageFiles(files);
+        return;
+    }
+    var t = e.target;
+    var editable = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    if (editable) return;
+    var text = data.getData("text/plain");
+    if (text) {
+        e.preventDefault();
+        applyClipboardText(text);
+    }
+});
+
+document.addEventListener("keydown", function(e) {
+    if (!stagedFiles.length) return;
+    if (document.getElementById("lightbox").classList.contains("open")) return;
+    var tag = e.target && e.target.tagName;
+    if (e.key === "Escape") {
+        clearStaged();
+    } else if (e.key === "Enter" && !e.shiftKey && tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT" && tag !== "BUTTON") {
+        e.preventDefault();
+        sendStaged();
+    }
 });
 
 window.addEventListener("beforeunload", function(e) {
@@ -3253,6 +3580,9 @@ window.addEventListener("beforeunload", function(e) {
 document.addEventListener("visibilitychange", function() {
     if (document.hidden) {
         log("Tab hidden - transfer continues in background", "info");
+    } else {
+        unreadCount = 0;
+        document.title = BASE_TITLE;
     }
 });
 
@@ -3272,6 +3602,20 @@ window.onload = function() {
             }
         });
     }, 30000);
+    document.getElementById("notify-toggle").checked = notifyEnabled;
+    if (!(navigator.maxTouchPoints > 0)) {
+        document.getElementById("camera-btn").style.display = "none";
+    }
+    document.getElementById("text-input").addEventListener("keydown", function(e) {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            if (this.value.trim()) sendText();
+            else if (stagedFiles.length) sendStaged();
+        }
+    });
+    document.getElementById("room-code-input").addEventListener("keydown", function(e) {
+        if (e.key === "Enter") joinRoom();
+    });
     initSocket();
 };
 </script>
