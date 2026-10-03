@@ -18,7 +18,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 SECRET = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
 
 app = Flask(__name__)
@@ -753,6 +753,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .drop-overlay { display: none; position: fixed; inset: 10px; z-index: 250; border: 3px dashed var(--text); border-radius: 16px; background: rgba(15,23,42,0.55); color: #fff; font-size: 18px; font-weight: 700; align-items: center; justify-content: center; pointer-events: none; }
         .drop-overlay.show { display: flex; }
 
+        .live-tip { margin-top: 4px; font-size: 11px; color: var(--muted); }
+        .live-tip summary { cursor: pointer; color: var(--muted2); }
+        .live-tip div { margin-top: 4px; line-height: 1.45; }
+
         @media (max-width: 768px) {
             body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
@@ -850,7 +854,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
                     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                     <span>Tap, drag, or press Ctrl+V to paste</span>
-                    <span style="font-size:11px;color:var(--muted2);">Live Photo: select both the HEIC and MOV files</span>
+                    <span style="font-size:11px;color:var(--muted2);">Live Photo: pick both the HEIC and MOV files (iPhone: Share, Options, All Photos Data, Save to Files)</span>
                     <input type="file" id="file-input" multiple accept="*/*" style="display:none;" onchange="handleFileSelect(event)">
                 </div>
                 <div class="row">
@@ -972,6 +976,9 @@ var notifyEnabled = localStorage.getItem("pairme_notify") !== "0";
 var audioCtx = null;
 var dragDepth = 0;
 var transferClock = { start: 0, total: 0 };
+var heic2anyBroken = false;
+var nativeHeic = null;
+var wakeLock = null;
 var STUN_SERVERS = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
@@ -2062,6 +2069,7 @@ function setProgress(pct) {
 function beginTransfer(label, totalBytes) {
     activeTransfers++;
     updateTransferBadge();
+    acquireWakeLock();
     document.getElementById("progress-wrap").style.display = "block";
     document.getElementById("send-status").textContent = label;
     transferClock = { start: performance.now(), total: totalBytes || 0 };
@@ -2072,6 +2080,7 @@ function beginTransfer(label, totalBytes) {
 function endTransfer() {
     activeTransfers = Math.max(0, activeTransfers - 1);
     updateTransferBadge();
+    if (activeTransfers === 0) releaseWakeLock();
     setTimeout(function() {
         if (activeTransfers === 0) document.getElementById("progress-wrap").style.display = "none";
     }, 600);
@@ -2573,6 +2582,68 @@ function convertHeicViaLibheifJs(blob) {
     });
 }
 
+function pairKey(name) {
+    return baseName(name).toLowerCase().replace(/^img_e(\d+)/, "img_$1");
+}
+
+function liveTipHtml() {
+    return '<details class="live-tip"><summary>No Live Photo video?</summary>' +
+        '<div>The iOS photo picker only hands over the still image. To send the video part, open the photo in Photos, tap Share, Options, turn on All Photos Data, then Save to Files. Choose both the HEIC and MOV files here and they are paired automatically.</div></details>';
+}
+
+function probeNativeHeic(item) {
+    if (nativeHeic === false) return Promise.resolve(false);
+    return new Promise(function(resolve) {
+        var img = new Image();
+        img.onload = function() {
+            nativeHeic = true;
+            resolve(true);
+        };
+        img.onerror = function() {
+            nativeHeic = false;
+            resolve(false);
+        };
+        img.src = item.url;
+    });
+}
+
+function nativeHeicToJpeg(item) {
+    return new Promise(function(resolve, reject) {
+        var img = new Image();
+        img.onload = function() {
+            try {
+                var canvas = document.createElement("canvas");
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                canvas.getContext("2d").drawImage(img, 0, 0);
+                canvas.toBlob(function(blob) {
+                    if (blob) resolve(blob);
+                    else reject(new Error("toBlob failed"));
+                }, "image/jpeg", 0.92);
+            } catch (err) {
+                reject(err);
+            }
+        };
+        img.onerror = function() { reject(new Error("native decode failed")); };
+        img.src = item.url;
+    });
+}
+
+function acquireWakeLock() {
+    if (!navigator.wakeLock || wakeLock) return;
+    navigator.wakeLock.request("screen").then(function(lock) {
+        wakeLock = lock;
+        lock.addEventListener("release", function() { wakeLock = null; });
+    }).catch(function() {});
+}
+
+function releaseWakeLock() {
+    if (!wakeLock) return;
+    var lock = wakeLock;
+    wakeLock = null;
+    lock.release().catch(function() {});
+}
+
 var heicChain = Promise.resolve();
 function runHeicSerial(task) {
     var run = heicChain.then(task, task);
@@ -2590,27 +2661,32 @@ function ensureJpegPreview(item) {
     var start = item.blob ? Promise.resolve(item.blob) : fetch(item.url).then(function(r) { return r.blob(); });
 
     function tryHeic2any(blob) {
+        if (heic2anyBroken) return Promise.reject(new Error("heic2any skipped"));
         if (typeof heic2any === "undefined") return Promise.reject(new Error("heic2any not loaded"));
         return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 }).then(function(result) {
             return Array.isArray(result) ? result[0] : result;
+        }).catch(function(err) {
+            var text = String(err && (err.message || err.code || err));
+            if (/LIBHEIF|not supported/i.test(text)) {
+                if (!heic2anyBroken) log("heic2any cannot decode this HEIC variant, using the libheif decoder from now on", "info");
+                heic2anyBroken = true;
+            }
+            throw err;
         });
     }
 
-    function tryLibheifJs(blob) {
-        return convertHeicViaLibheifJs(blob);
+    function decode(blob) {
+        var first = nativeHeic === true ? nativeHeicToJpeg(item) : Promise.reject(new Error("native unavailable"));
+        return first.catch(function() {
+            return tryHeic2any(blob);
+        }).catch(function() {
+            return convertHeicViaLibheifJs(blob);
+        });
     }
 
     item._jpegPromise = start.then(function(blob) {
-        return runHeicSerial(function() {
-            return tryHeic2any(blob).catch(function(err1) {
-                log("HEIC convert (heic2any) failed, trying fallback decoder: " + (err1 && err1.message ? err1.message : err1), "warn");
-                return tryLibheifJs(blob).catch(function(err2) {
-                    log("HEIC convert (fallback) failed: " + (err2 && err2.message ? err2.message : err2), "warn");
-                    item.previewFailed = true;
-                    throw err2;
-                });
-            });
-        });
+        if (nativeHeic === true) return decode(blob);
+        return runHeicSerial(function() { return decode(blob); });
     }).then(function(jpegBlob) {
         item.jpegBlob = jpegBlob;
         item.jpegUrl = URL.createObjectURL(jpegBlob);
@@ -2618,6 +2694,10 @@ function ensureJpegPreview(item) {
         item.convertedFromHeic = true;
         item.previewFailed = false;
         return jpegBlob;
+    }, function(err) {
+        log("HEIC convert failed: " + (err && err.message ? err.message : err), "warn");
+        item.previewFailed = true;
+        throw err;
     });
 
     item._jpegPromise.catch(function() {});
@@ -2632,11 +2712,18 @@ function prepareItemPreview(item) {
             resolve(item);
             return;
         }
-        ensureJpegPreview(item).then(function() {
-            resolve(item);
-        }).catch(function() {
-            item.previewFailed = true;
-            resolve(item);
+        probeNativeHeic(item).then(function(native) {
+            if (native) {
+                item.nativeHeic = true;
+                resolve(item);
+                return;
+            }
+            ensureJpegPreview(item).then(function() {
+                resolve(item);
+            }).catch(function() {
+                item.previewFailed = true;
+                resolve(item);
+            });
         });
     });
 }
@@ -2662,7 +2749,7 @@ function buildUnits(items) {
     var used = {};
 
     items.forEach(function(it) {
-        var key = baseName(it.name).toLowerCase();
+        var key = pairKey(it.name);
         if (isStillImage(it)) {
             if (!stills[key]) stills[key] = it;
         } else if (isMovItem(it)) {
@@ -2672,7 +2759,7 @@ function buildUnits(items) {
 
     var units = [];
     items.forEach(function(it) {
-        var key = baseName(it.name).toLowerCase();
+        var key = pairKey(it.name);
         if (used[it.name + "|" + it.size]) return;
         if (isStillImage(it) && movs[key] && stills[key] === it) {
             var mov = movs[key];
@@ -2820,6 +2907,10 @@ function attachLiveStage(stageEl, unit, modeGetter) {
         video.preload = "auto";
         video.style.display = "none";
         video.addEventListener("ended", function() { hideVideo(); });
+        video.addEventListener("error", function() {
+            showToast("This browser cannot play the Live video. Use Download to save the MOV.");
+            hideVideo();
+        });
         stageEl.appendChild(video);
         return video;
     }
@@ -3116,6 +3207,11 @@ function renderBatchBody(batchId) {
         });
         body.appendChild(listEl);
     }
+    var movCount = batch.items.filter(isMovItem).length;
+    var hasLive = units.some(function(u) { return u.kind === "live"; });
+    if (hasHeic && !hasLive && !movCount && batch.items.length >= batch.total) {
+        body.insertAdjacentHTML("beforeend", liveTipHtml());
+    }
 }
 
 function scheduleBatchRender(batchId) {
@@ -3234,6 +3330,8 @@ function addReceived(type, data, sender) {
         } else if (isAudioType(item.type)) {
             previewHtml = '<div class="audio-player-wrap"><audio controls preload="metadata" src="' + item.url + '"></audio></div>';
         }
+
+        if (isHeicType(item.type, item.name)) previewHtml += liveTipHtml();
 
         li.innerHTML = header +
             '<div class="file-card">' +
@@ -3583,6 +3681,7 @@ document.addEventListener("visibilitychange", function() {
     } else {
         unreadCount = 0;
         document.title = BASE_TITLE;
+        if (activeTransfers > 0) acquireWakeLock();
     }
 });
 
