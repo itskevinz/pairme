@@ -18,7 +18,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 SECRET = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
 
 app = Flask(__name__)
@@ -535,9 +535,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <link rel="apple-touch-icon" href="https://imgg.fr/r/LkSsr60e.png">
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/libheif-js@1.18.2/libheif-wasm/libheif-bundle.js"></script>
     <style>
         :root {
             --bg: #f8fafc;
@@ -757,6 +755,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .live-tip summary { cursor: pointer; color: var(--muted2); }
         .live-tip div { margin-top: 4px; line-height: 1.45; }
 
+        img.lz { opacity: 0; transition: opacity .15s; }
+        img.lz.ready { opacity: 1; }
+        .media-thumb.loading, .batch-file-thumb.loading, .stage-item.loading, .file-preview.loading {
+            background: linear-gradient(90deg, #0f172a 25%, #1e293b 50%, #0f172a 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.2s linear infinite;
+        }
+        @keyframes shimmer { to { background-position: -200% 0; } }
+        .file-preview { position: relative; min-height: 120px; }
+        .file-preview .play-badge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(15,23,42,0.35); pointer-events: none; }
+        .file-preview .play-badge svg { width: 30px; height: 30px; color: #fff; }
+        .lb-loading { position: absolute; color: #cbd5e1; font-size: 12px; }
+
         @media (max-width: 768px) {
             body { height: 100%; overflow: auto; }
             .mobile-nav { display: flex; }
@@ -963,7 +974,7 @@ var RELAY_BATCH_CONCURRENCY = 2;
 var P2P_CONNECT_TIMEOUT = 2500;
 var P2P_STALE_MS = 12000;
 var BUFFER_STALE_MS = 120000;
-var BATCH_RENDER_DELAY = 160;
+var BATCH_RENDER_DELAY = 450;
 var p2pDraining = {};
 var p2pWaiters = {};
 var lastProgressPaint = 0;
@@ -976,7 +987,6 @@ var notifyEnabled = localStorage.getItem("pairme_notify") !== "0";
 var audioCtx = null;
 var dragDepth = 0;
 var transferClock = { start: 0, total: 0 };
-var heic2anyBroken = false;
 var nativeHeic = null;
 var wakeLock = null;
 var STUN_SERVERS = {
@@ -1317,7 +1327,13 @@ function normalizePastedFile(file, index) {
 function stageFiles(files) {
     files.forEach(function(file) {
         var named = normalizePastedFile(file, stagedFiles.length);
-        stagedFiles.push({ file: named, url: isImageType(named.type) ? URL.createObjectURL(named) : "" });
+        var type = named.type || guessMimeFromName(named.name);
+        var visual = isImageType(type) || isHeicType(type, named.name) || isVideoType(type);
+        stagedFiles.push({
+            file: named,
+            visual: visual,
+            thumb: { blob: named, name: named.name, type: type, url: isVideoType(type) ? URL.createObjectURL(named) : "" }
+        });
     });
     renderStageTray();
     if (window.innerWidth <= 768) switchTab("transfer");
@@ -1327,15 +1343,13 @@ function stageFiles(files) {
 function unstageFile(index) {
     var entry = stagedFiles[index];
     if (!entry) return;
-    if (entry.url) URL.revokeObjectURL(entry.url);
+    disposeItem(entry.thumb);
     stagedFiles.splice(index, 1);
     renderStageTray();
 }
 
 function clearStaged() {
-    stagedFiles.forEach(function(entry) {
-        if (entry.url) URL.revokeObjectURL(entry.url);
-    });
+    stagedFiles.forEach(function(entry) { disposeItem(entry.thumb); });
     stagedFiles = [];
     renderStageTray();
 }
@@ -1353,6 +1367,10 @@ function sendStaged() {
 
 function renderStageTray() {
     var tray = document.getElementById("stage-tray");
+    var old = tray.querySelectorAll("img.lz");
+    for (var k = 0; k < old.length; k++) {
+        if (thumbObserver) thumbObserver.unobserve(old[k]);
+    }
     if (!stagedFiles.length) {
         tray.style.display = "none";
         tray.innerHTML = "";
@@ -1361,8 +1379,8 @@ function renderStageTray() {
     var total = stagedFiles.reduce(function(sum, entry) { return sum + entry.file.size; }, 0);
     var html = '<div class="stage-list">';
     stagedFiles.forEach(function(entry, i) {
-        html += '<div class="stage-item" title="' + escapeHtml(entry.file.name) + '">' +
-            (entry.url ? '<img src="' + entry.url + '" alt="">' : '<span>' + escapeHtml(fileExtLabel(entry.file.name, entry.file.type)) + '</span>') +
+        html += '<div class="stage-item" data-i="' + i + '" title="' + escapeHtml(entry.file.name) + '">' +
+            (entry.visual ? '' : '<span>' + escapeHtml(fileExtLabel(entry.file.name, entry.file.type)) + '</span>') +
             '<button type="button" class="stage-remove" aria-label="Remove" onclick="unstageFile(' + i + ')">&times;</button>' +
         '</div>';
     });
@@ -1371,6 +1389,13 @@ function renderStageTray() {
         '<button type="button" class="action-btn primary" onclick="sendStaged()">Send</button></span></div>';
     tray.innerHTML = html;
     tray.style.display = "flex";
+    var tiles = tray.querySelectorAll(".stage-item");
+    for (var j = 0; j < tiles.length; j++) {
+        var entry = stagedFiles[Number(tiles[j].getAttribute("data-i"))];
+        if (!entry || !entry.visual) continue;
+        var im = makeLazyImg(tiles[j], entry.thumb, THUMB_SIZE);
+        tiles[j].insertBefore(im, tiles[j].firstChild);
+    }
 }
 
 function applyClipboardText(text) {
@@ -1422,11 +1447,7 @@ function readClipboardButton() {
 }
 
 function releaseItem(item) {
-    [item.url, item.jpegUrl].forEach(function(u) {
-        if (u) {
-            try { URL.revokeObjectURL(u); } catch (e) {}
-        }
-    });
+    disposeItem(item);
     if (item._mediaId) delete mediaRegistry[item._mediaId];
 }
 
@@ -2536,50 +2557,523 @@ function registerMedia(item) {
     return id;
 }
 
-var libheifInstance = null;
-function getLibheif() {
-    if (libheifInstance) return libheifInstance;
-    if (typeof libheif === "undefined") return null;
-    try {
-        libheifInstance = libheif();
-    } catch (e) {
-        libheifInstance = null;
+/* ================= Lazy thumbnail / decode pipeline ================= */
+var THUMB_SIZE = 320;
+var CARD_SIZE = 720;
+var VIEW_SIZE = 2560;
+var THUMB_CONCURRENCY = 3;
+var VIEW_CACHE_MAX = 5;
+var HEIC_WORKER_IDLE_MS = 15000;
+var LIBHEIF_URL = "https://cdn.jsdelivr.net/npm/libheif-js@1.18.2/libheif-wasm/libheif-bundle.js";
+var thumbQueue = [];
+var thumbActive = 0;
+var thumbObserver = null;
+var viewLru = [];
+
+function makeLimiter(max) {
+    var active = 0;
+    var waiting = [];
+    function next() {
+        while (active < max && waiting.length) {
+            var t = waiting.shift();
+            active++;
+            Promise.resolve().then(t.fn).then(t.resolve, t.reject).then(function() {
+                active--;
+                next();
+            });
+        }
     }
-    return libheifInstance;
+    return function(fn) {
+        return new Promise(function(resolve, reject) {
+            waiting.push({ fn: fn, resolve: resolve, reject: reject });
+            next();
+        });
+    };
 }
 
-function convertHeicViaLibheifJs(blob) {
+function getItemBlob(item) {
+    if (item.blob) return Promise.resolve(item.blob);
+    return fetch(item.url).then(function(r) { return r.blob(); });
+}
+
+function bitmapToBlob(src, max, quality, mime) {
+    var sw = src.videoWidth || src.naturalWidth || src.width;
+    var sh = src.videoHeight || src.naturalHeight || src.height;
+    var s = max ? Math.min(1, max / Math.max(sw, sh)) : 1;
+    var w = Math.max(1, Math.round(sw * s));
+    var h = Math.max(1, Math.round(sh * s));
+    var c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    var ctx = c.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, w, h);
+    if (src.close) { try { src.close(); } catch (e) {} }
     return new Promise(function(resolve, reject) {
-        var lh = getLibheif();
-        if (!lh) { reject(new Error("libheif-js not available")); return; }
-        blob.arrayBuffer().then(function(buf) {
-            var decoder = new lh.HeifDecoder();
-            var data;
+        c.toBlob(function(b) {
+            c.width = c.height = 0;
+            if (b) resolve(b);
+            else reject(new Error("toBlob failed"));
+        }, mime || "image/jpeg", quality || 0.8);
+    });
+}
+
+function decodeViaImage(blob) {
+    return new Promise(function(resolve, reject) {
+        var u = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function() { URL.revokeObjectURL(u); resolve(img); };
+        img.onerror = function() { URL.revokeObjectURL(u); reject(new Error("decode failed")); };
+        img.src = u;
+    });
+}
+
+function rasterThumbBlob(blob, size, type) {
+    var out = /png|gif|webp|avif|svg/.test(type || "") ? "image/webp" : "image/jpeg";
+    var decode = (typeof createImageBitmap === "function")
+        ? createImageBitmap(blob).catch(function() { return decodeViaImage(blob); })
+        : decodeViaImage(blob);
+    return decode.then(function(bmp) { return bitmapToBlob(bmp, size, 0.8, out); });
+}
+
+function videoPosterBlob(item, size) {
+    return new Promise(function(resolve, reject) {
+        var v = document.createElement("video");
+        var done = false;
+        var timer = null;
+        function finish(err, blob) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            v.onloadedmetadata = v.onseeked = v.onerror = null;
+            v.removeAttribute("src");
+            try { v.load(); } catch (e) {}
+            if (err) reject(err); else resolve(blob);
+        }
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = "metadata";
+        v.onloadedmetadata = function() {
+            try { v.currentTime = Math.min(0.2, (v.duration || 1) / 4); } catch (e) { finish(e); }
+        };
+        v.onseeked = function() {
+            bitmapToBlob(v, size, 0.75, "image/jpeg").then(function(b) { finish(null, b); }, finish);
+        };
+        v.onerror = function() { finish(new Error("video poster failed")); };
+        timer = setTimeout(function() { finish(new Error("video poster timeout")); }, 6000);
+        v.src = item.url;
+    });
+}
+
+/* ---- HEIC: native (Safari) -> worker pool -> main thread fallback ---- */
+var nativeLimiter = makeLimiter(2);
+
+function nativeHeicRender(blob, max, quality) {
+    if (nativeHeic === false || typeof createImageBitmap !== "function") return Promise.reject(new Error("no native"));
+    return nativeLimiter(function() {
+        if (nativeHeic === false) return Promise.reject(new Error("no native"));
+        return createImageBitmap(blob).then(function(bmp) {
+            nativeHeic = true;
+            return bitmapToBlob(bmp, max, quality, "image/jpeg");
+        }, function(e) {
+            nativeHeic = false;
+            throw e;
+        });
+    });
+}
+
+var HEIC_WORKER_SRC = [
+    "var lh = null;",
+    "function fail(id, msg) { postMessage({ id: id, err: String(msg) }); }",
+    "onmessage = function (e) {",
+    "  var m = e.data;",
+    "  try {",
+    "    if (typeof OffscreenCanvas === 'undefined') { fail(m.id, 'no OffscreenCanvas'); return; }",
+    "    if (!lh) { importScripts('" + LIBHEIF_URL + "'); lh = self.libheif(); }",
+    "    var dec = new lh.HeifDecoder();",
+    "    var imgs = dec.decode(new Uint8Array(m.buf));",
+    "    if (!imgs || !imgs.length) { fail(m.id, 'no image'); return; }",
+    "    var im = imgs[0];",
+    "    var w = im.get_width(), h = im.get_height();",
+    "    var data = new ImageData(w, h);",
+    "    im.display(data, function (out) {",
+    "      try {",
+    "        if (!out) { fail(m.id, 'display failed'); return; }",
+    "        var full = new OffscreenCanvas(w, h);",
+    "        full.getContext('2d').putImageData(out, 0, 0);",
+    "        var s = m.max ? Math.min(1, m.max / Math.max(w, h)) : 1;",
+    "        var target = full;",
+    "        if (s < 1) {",
+    "          var tw = Math.max(1, Math.round(w * s)), th = Math.max(1, Math.round(h * s));",
+    "          target = new OffscreenCanvas(tw, th);",
+    "          var ctx = target.getContext('2d');",
+    "          ctx.imageSmoothingQuality = 'high';",
+    "          ctx.drawImage(full, 0, 0, tw, th);",
+    "        }",
+    "        target.convertToBlob({ type: 'image/jpeg', quality: m.q }).then(function (b) {",
+    "          postMessage({ id: m.id, blob: b });",
+    "        }, function (err) { fail(m.id, err); });",
+    "      } catch (err2) { fail(m.id, err2); }",
+    "      try { im.free(); } catch (e3) {}",
+    "    });",
+    "  } catch (err) { fail(m.id, err); }",
+    "};"
+].join("\n");
+
+var heicPool = { workers: [], idle: [], queue: [], broken: false, seq: 0, workerUrl: null, reapTimer: null };
+
+function killHeicWorkers() {
+    heicPool.workers.forEach(function(x) {
+        try { x.terminate(); } catch (e) {}
+        if (x.job) {
+            var j = x.job;
+            x.job = null;
+            j.reject(new Error("worker stopped"));
+        }
+    });
+    heicPool.workers = [];
+    heicPool.idle = [];
+}
+
+function scheduleHeicReap() {
+    if (heicPool.reapTimer) clearTimeout(heicPool.reapTimer);
+    heicPool.reapTimer = setTimeout(function() {
+        heicPool.reapTimer = null;
+        if (heicPool.queue.length) return;
+        var busy = heicPool.workers.some(function(x) { return x.job; });
+        if (busy) { scheduleHeicReap(); return; }
+        killHeicWorkers();
+    }, HEIC_WORKER_IDLE_MS);
+}
+
+function spawnHeicWorker() {
+    if (!heicPool.workerUrl) {
+        heicPool.workerUrl = URL.createObjectURL(new Blob([HEIC_WORKER_SRC], { type: "text/javascript" }));
+    }
+    var w = new Worker(heicPool.workerUrl);
+    w.job = null;
+    w.onmessage = function(e) {
+        var m = e.data || {};
+        var job = w.job;
+        w.job = null;
+        heicPool.idle.push(w);
+        if (job) {
+            if (m.err) job.reject(new Error(m.err));
+            else job.resolve(m.blob);
+        }
+        pumpHeicPool();
+        scheduleHeicReap();
+    };
+    w.onerror = function() {
+        log("HEIC worker failed, falling back to main thread", "warn");
+        heicPool.broken = true;
+        killHeicWorkers();
+        heicPool.queue.splice(0).forEach(function(j) { j.reject(new Error("worker error")); });
+    };
+    heicPool.workers.push(w);
+    return w;
+}
+
+function dispatchHeic(w, job) {
+    w.job = job;
+    readBlobBuffer(job.blob).then(function(buf) {
+        if (w.job !== job) return;
+        w.postMessage({ id: ++heicPool.seq, buf: buf, max: job.max, q: job.q }, [buf]);
+    }, function(err) {
+        if (w.job === job) {
+            w.job = null;
+            heicPool.idle.push(w);
+        }
+        job.reject(err);
+        pumpHeicPool();
+    });
+}
+
+function pumpHeicPool() {
+    var limit = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+    while (heicPool.queue.length) {
+        var w = heicPool.idle.pop();
+        if (!w) {
+            if (heicPool.workers.length >= limit) break;
             try {
-                data = decoder.decode(new Uint8Array(buf));
+                w = spawnHeicWorker();
             } catch (e) {
-                reject(e);
+                heicPool.broken = true;
+                heicPool.queue.splice(0).forEach(function(j) { j.reject(new Error("no worker")); });
                 return;
             }
-            if (!data || !data.length) { reject(new Error("No image data decoded")); return; }
-            var image = data[0];
-            var w = image.get_width();
-            var h = image.get_height();
-            var canvas = document.createElement("canvas");
-            canvas.width = w;
-            canvas.height = h;
-            var ctx = canvas.getContext("2d");
-            var imgData = ctx.createImageData(w, h);
-            image.display(imgData, function(displayData) {
-                if (!displayData) { reject(new Error("libheif display() failed")); return; }
-                ctx.putImageData(displayData, 0, 0);
-                canvas.toBlob(function(jpegBlob) {
-                    if (jpegBlob) resolve(jpegBlob);
-                    else reject(new Error("canvas.toBlob returned null"));
-                }, "image/jpeg", 0.92);
-            });
-        }).catch(reject);
+        }
+        dispatchHeic(w, heicPool.queue.shift());
+    }
+}
+
+function heicWorkerRender(blob, max, quality) {
+    if (heicPool.broken || typeof Worker === "undefined") return Promise.reject(new Error("no worker"));
+    return new Promise(function(resolve, reject) {
+        heicPool.queue.push({ blob: blob, max: max, q: quality, resolve: resolve, reject: reject });
+        pumpHeicPool();
     });
+}
+
+var libheifInst = null;
+var libheifScript = null;
+var mainHeicChain = Promise.resolve();
+
+function loadLibheifMain() {
+    if (libheifInst) return Promise.resolve(libheifInst);
+    if (!libheifScript) {
+        libheifScript = new Promise(function(resolve, reject) {
+            if (typeof libheif === "function") { resolve(); return; }
+            var s = document.createElement("script");
+            s.src = LIBHEIF_URL;
+            s.onload = function() { resolve(); };
+            s.onerror = function() { libheifScript = null; reject(new Error("libheif failed to load")); };
+            document.head.appendChild(s);
+        });
+    }
+    return libheifScript.then(function() {
+        libheifInst = libheifInst || libheif();
+        return libheifInst;
+    });
+}
+
+function mainThreadHeicRender(blob, max, quality) {
+    var task = function() {
+        return loadLibheifMain().then(function(lh) {
+            return readBlobBuffer(blob).then(function(buf) {
+                var imgs = new lh.HeifDecoder().decode(new Uint8Array(buf));
+                if (!imgs || !imgs.length) throw new Error("No image data decoded");
+                var im = imgs[0];
+                var w = im.get_width();
+                var h = im.get_height();
+                var canvas = document.createElement("canvas");
+                canvas.width = w;
+                canvas.height = h;
+                var ctx = canvas.getContext("2d");
+                return new Promise(function(resolve, reject) {
+                    im.display(ctx.createImageData(w, h), function(out) {
+                        if (!out) { reject(new Error("libheif display() failed")); return; }
+                        ctx.putImageData(out, 0, 0);
+                        try { im.free(); } catch (e) {}
+                        resolve(canvas);
+                    });
+                });
+            });
+        }).then(function(canvas) {
+            return bitmapToBlob(canvas, max, quality, "image/jpeg");
+        });
+    };
+    var run = mainHeicChain.then(task, task);
+    mainHeicChain = run.catch(function() {});
+    return run;
+}
+
+/* max = 0 means full resolution */
+function heicRender(blob, max, quality) {
+    return nativeHeicRender(blob, max, quality).catch(function() {
+        return heicWorkerRender(blob, max, quality).catch(function(err) {
+            var msg = String((err && err.message) || err);
+            if (heicPool.broken || /OffscreenCanvas|no worker|worker/i.test(msg)) {
+                return mainThreadHeicRender(blob, max, quality);
+            }
+            throw err;
+        });
+    });
+}
+
+/* ---- thumbnails: created only when the tile is visible ---- */
+function produceThumbBlob(item, size) {
+    if (isVideoType(item.type)) return videoPosterBlob(item, size);
+    return getItemBlob(item).then(function(blob) {
+        if (isHeicType(item.type, item.name)) return heicRender(blob, size, 0.8);
+        return rasterThumbBlob(blob, size, item.type);
+    });
+}
+
+function makeThumb(item, size) {
+    item.thumbs = item.thumbs || {};
+    item.thumbJobs = item.thumbJobs || {};
+    if (item.thumbs[size]) return Promise.resolve(item.thumbs[size]);
+    if (item.thumbJobs[size]) return item.thumbJobs[size];
+    var p = produceThumbBlob(item, size).then(function(blob) {
+        delete item.thumbJobs[size];
+        var u = URL.createObjectURL(blob);
+        if (item._dead) { URL.revokeObjectURL(u); return null; }
+        item.thumbs[size] = u;
+        return u;
+    }, function(err) {
+        delete item.thumbJobs[size];
+        throw err;
+    });
+    item.thumbJobs[size] = p;
+    return p;
+}
+
+function pumpThumbs() {
+    while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
+        var job = thumbQueue.shift();
+        if (!job.alive()) { job.drop(); continue; }
+        runThumbJob(job);
+    }
+}
+
+function runThumbJob(job) {
+    thumbActive++;
+    job.started = true;
+    job.run().then(function(url) { job.done(null, url); }, function(err) { job.done(err); }).then(function() {
+        thumbActive--;
+        setTimeout(pumpThumbs, 0);
+    });
+}
+
+function getThumbObserver() {
+    if (thumbObserver) return thumbObserver;
+    if (!("IntersectionObserver" in window)) return null;
+    thumbObserver = new IntersectionObserver(function(entries) {
+        entries.forEach(function(en) {
+            var el = en.target;
+            if (en.isIntersecting) {
+                startThumb(el);
+            } else if (el._thumbJob && !el._thumbJob.started) {
+                el._thumbJob.cancelled = true;
+                el._thumbJob = null;
+            }
+        });
+    }, { rootMargin: "400px 0px" });
+    return thumbObserver;
+}
+
+function showThumb(img, url) {
+    if (thumbObserver) thumbObserver.unobserve(img);
+    img.decoding = "async";
+    img.onload = function() {
+        img.classList.add("ready");
+        if (img.parentNode) img.parentNode.classList.remove("loading");
+    };
+    img.onerror = function() {
+        img.onerror = null;
+        thumbFailed(img, img._item);
+    };
+    img.src = url;
+}
+
+function thumbFallbackNode(item, big) {
+    var label = isHeicType(item.type, item.name) ? "HEIC" : fileExtLabel(item.name, item.type);
+    var d = document.createElement("div");
+    d.className = "heic-fallback";
+    d.innerHTML = '<span class="heic-chip">' + escapeHtml(label) + '</span>' +
+        (big ? '<span class="heic-sub">Preview not available here.<br>The original file is intact, download to view.</span>' : "");
+    return d;
+}
+
+function thumbFailed(img, item) {
+    if (!item) return;
+    item.thumbFailed = true;
+    var host = img.parentNode;
+    if (!host) return;
+    host.classList.remove("loading");
+    if (isVideoType(item.type)) {
+        img.style.display = "none";
+        return;
+    }
+    host.replaceChild(thumbFallbackNode(item, host.classList.contains("file-preview")), img);
+}
+
+function startThumb(img) {
+    var item = img._item;
+    if (!item || item._dead) return;
+    var size = img._size;
+    var cached = item.thumbs && item.thumbs[size];
+    if (cached) { showThumb(img, cached); return; }
+    if (item.thumbFailed) { thumbFailed(img, item); return; }
+    if (img._thumbJob) return;
+    var job = {
+        started: false,
+        cancelled: false,
+        alive: function() { return !job.cancelled && !item._dead && img.isConnected; },
+        drop: function() {
+            if (img._thumbJob === job) img._thumbJob = null;
+            if (thumbObserver) thumbObserver.unobserve(img);
+        },
+        run: function() { return makeThumb(item, size); },
+        done: function(err, url) {
+            if (img._thumbJob === job) img._thumbJob = null;
+            if (err || !url) {
+                if (err) log("Thumbnail failed for " + item.name + ": " + (err.message || err), "warn");
+                thumbFailed(img, item);
+                return;
+            }
+            showThumb(img, url);
+        }
+    };
+    img._thumbJob = job;
+    thumbQueue.push(job);
+    pumpThumbs();
+}
+
+function lazyThumb(img, item, size) {
+    img.classList.add("lz");
+    img._item = item;
+    img._size = size || THUMB_SIZE;
+    var cached = item.thumbs && item.thumbs[img._size];
+    if (cached) { showThumb(img, cached); return; }
+    if (item.thumbFailed) { setTimeout(function() { thumbFailed(img, item); }, 0); return; }
+    var obs = getThumbObserver();
+    if (obs) obs.observe(img);
+    else setTimeout(function() { startThumb(img); }, 0);
+}
+
+function makeLazyImg(host, item, size) {
+    host.classList.add("loading");
+    var im = document.createElement("img");
+    im.alt = item.name || "";
+    host.appendChild(im);
+    lazyThumb(im, item, size);
+    return im;
+}
+
+function revokeUrl(u) {
+    if (u) { try { URL.revokeObjectURL(u); } catch (e) {} }
+}
+
+function disposeItem(item) {
+    item._dead = true;
+    revokeUrl(item.url);
+    revokeUrl(item.viewUrl);
+    item.viewUrl = null;
+    if (item.thumbs) Object.keys(item.thumbs).forEach(function(k) { revokeUrl(item.thumbs[k]); });
+    item.thumbs = {};
+    var i = viewLru.indexOf(item);
+    if (i >= 0) viewLru.splice(i, 1);
+}
+
+/* ---- full-size view (lightbox only), HEIC converted on demand ---- */
+function touchView(item) {
+    var i = viewLru.indexOf(item);
+    if (i >= 0) viewLru.splice(i, 1);
+    viewLru.push(item);
+    while (viewLru.length > VIEW_CACHE_MAX) {
+        var old = viewLru.shift();
+        if (old.viewUrl) { revokeUrl(old.viewUrl); old.viewUrl = null; }
+    }
+}
+
+function ensureViewUrl(item) {
+    if (item.viewUrl) { touchView(item); return Promise.resolve(item.viewUrl); }
+    if (item._viewP) return item._viewP;
+    item._viewP = getItemBlob(item).then(function(b) {
+        return heicRender(b, VIEW_SIZE, 0.9);
+    }).then(function(jb) {
+        item._viewP = null;
+        if (item._dead) return null;
+        item.viewUrl = URL.createObjectURL(jb);
+        touchView(item);
+        return item.viewUrl;
+    }, function(err) {
+        item._viewP = null;
+        throw err;
+    });
+    return item._viewP;
 }
 
 function pairKey(name) {
@@ -2589,44 +3083,6 @@ function pairKey(name) {
 function liveTipHtml() {
     return '<details class="live-tip"><summary>No Live Photo video?</summary>' +
         '<div>The iOS photo picker only hands over the still image. To send the video part, open the photo in Photos, tap Share, Options, turn on All Photos Data, then Save to Files. Choose both the HEIC and MOV files here and they are paired automatically.</div></details>';
-}
-
-function probeNativeHeic(item) {
-    if (nativeHeic === false) return Promise.resolve(false);
-    return new Promise(function(resolve) {
-        var img = new Image();
-        img.onload = function() {
-            nativeHeic = true;
-            resolve(true);
-        };
-        img.onerror = function() {
-            nativeHeic = false;
-            resolve(false);
-        };
-        img.src = item.url;
-    });
-}
-
-function nativeHeicToJpeg(item) {
-    return new Promise(function(resolve, reject) {
-        var img = new Image();
-        img.onload = function() {
-            try {
-                var canvas = document.createElement("canvas");
-                canvas.width = img.naturalWidth;
-                canvas.height = img.naturalHeight;
-                canvas.getContext("2d").drawImage(img, 0, 0);
-                canvas.toBlob(function(blob) {
-                    if (blob) resolve(blob);
-                    else reject(new Error("toBlob failed"));
-                }, "image/jpeg", 0.92);
-            } catch (err) {
-                reject(err);
-            }
-        };
-        img.onerror = function() { reject(new Error("native decode failed")); };
-        img.src = item.url;
-    });
 }
 
 function acquireWakeLock() {
@@ -2642,105 +3098,6 @@ function releaseWakeLock() {
     var lock = wakeLock;
     wakeLock = null;
     lock.release().catch(function() {});
-}
-
-var heicChain = Promise.resolve();
-function runHeicSerial(task) {
-    var run = heicChain.then(task, task);
-    heicChain = run.catch(function() {});
-    return run;
-}
-
-function ensureJpegPreview(item) {
-    if (item._jpegPromise) return item._jpegPromise;
-    if (!isHeicType(item.type, item.name)) {
-        item._jpegPromise = Promise.resolve(item.blob || null);
-        return item._jpegPromise;
-    }
-
-    var start = item.blob ? Promise.resolve(item.blob) : fetch(item.url).then(function(r) { return r.blob(); });
-
-    function tryHeic2any(blob) {
-        if (heic2anyBroken) return Promise.reject(new Error("heic2any skipped"));
-        if (typeof heic2any === "undefined") return Promise.reject(new Error("heic2any not loaded"));
-        return heic2any({ blob: blob, toType: "image/jpeg", quality: 0.92 }).then(function(result) {
-            return Array.isArray(result) ? result[0] : result;
-        }).catch(function(err) {
-            var text = String(err && (err.message || err.code || err));
-            if (/LIBHEIF|not supported/i.test(text)) {
-                if (!heic2anyBroken) log("heic2any cannot decode this HEIC variant, using the libheif decoder from now on", "info");
-                heic2anyBroken = true;
-            }
-            throw err;
-        });
-    }
-
-    function decode(blob) {
-        var first = nativeHeic === true ? nativeHeicToJpeg(item) : Promise.reject(new Error("native unavailable"));
-        return first.catch(function() {
-            return tryHeic2any(blob);
-        }).catch(function() {
-            return convertHeicViaLibheifJs(blob);
-        });
-    }
-
-    item._jpegPromise = start.then(function(blob) {
-        if (nativeHeic === true) return decode(blob);
-        return runHeicSerial(function() { return decode(blob); });
-    }).then(function(jpegBlob) {
-        item.jpegBlob = jpegBlob;
-        item.jpegUrl = URL.createObjectURL(jpegBlob);
-        item.previewUrl = item.jpegUrl;
-        item.convertedFromHeic = true;
-        item.previewFailed = false;
-        return jpegBlob;
-    }, function(err) {
-        log("HEIC convert failed: " + (err && err.message ? err.message : err), "warn");
-        item.previewFailed = true;
-        throw err;
-    });
-
-    item._jpegPromise.catch(function() {});
-    return item._jpegPromise;
-}
-
-function prepareItemPreview(item) {
-    return new Promise(function(resolve) {
-        normalizeItemMime(item);
-        item.previewUrl = item.url;
-        if (!isHeicType(item.type, item.name)) {
-            resolve(item);
-            return;
-        }
-        probeNativeHeic(item).then(function(native) {
-            if (native) {
-                item.nativeHeic = true;
-                resolve(item);
-                return;
-            }
-            ensureJpegPreview(item).then(function() {
-                resolve(item);
-            }).catch(function() {
-                item.previewFailed = true;
-                resolve(item);
-            });
-        });
-    });
-}
-
-function previewSrc(item) {
-    return item.previewUrl || item.url;
-}
-
-function heicFallbackThumbHtml() {
-    return '<div class="heic-fallback"><span class="heic-chip">HEIC</span></div>';
-}
-
-function heicFallbackCardHtml() {
-    return '<div class="heic-fallback">' +
-        '<span class="heic-chip">HEIC</span>' +
-        '<span class="heic-sub">Preview not supported in this browser.<br>Original file is intact, download to view.</span>' +
-    '</div>';
 }
 
 function buildUnits(items) {
@@ -2809,8 +3166,12 @@ function downloadAsJpg(item) {
         return;
     }
     showToast("Converting to JPG...");
-    ensureJpegPreview(item).then(function() {
-        triggerDownload(item.jpegUrl, swapExt(item.name, "jpg"));
+    getItemBlob(item).then(function(b) {
+        return heicRender(b, 0, 0.92);
+    }).then(function(jb) {
+        var u = URL.createObjectURL(jb);
+        triggerDownload(u, swapExt(item.name, "jpg"));
+        setTimeout(function() { URL.revokeObjectURL(u); }, 10000);
     }).catch(function() {
         showToast("Could not convert. Downloading original HEIC instead.");
         triggerDownload(item.url, item.name);
@@ -2965,76 +3326,6 @@ function attachLiveStage(stageEl, unit, modeGetter) {
     };
 }
 
-function buildLiveCard(unit, container) {
-    var unitId = registerUnit(unit);
-    var mode = "photo";
-    var stillMediaId = registerMedia(unit.still);
-    var movMediaId = registerMedia(unit.mov);
-    unit.stillMediaId = stillMediaId;
-    unit.movMediaId = movMediaId;
-
-    var wrap = document.createElement("div");
-    wrap.className = "live-card";
-
-    var stage = document.createElement("div");
-    stage.className = "live-stage";
-    if (unit.still.previewFailed) {
-        stage.innerHTML = heicFallbackCardHtml() + liveBadgeHtml();
-    } else {
-        stage.innerHTML = '<img src="' + previewSrc(unit.still) + '" alt="' + escapeHtml(unit.still.name) + '">' +
-            liveBadgeHtml() +
-            '<div class="live-hint">Press and hold to play</div>';
-    }
-    wrap.appendChild(stage);
-
-    var ctl = attachLiveStage(stage, unit, function() { return mode; });
-
-    var toolbar = document.createElement("div");
-    toolbar.className = "live-toolbar";
-    var seg = document.createElement("div");
-    seg.className = "seg";
-    var bPhoto = document.createElement("button");
-    bPhoto.textContent = "Photo";
-    bPhoto.className = "on";
-    var bLive = document.createElement("button");
-    bLive.textContent = "Live";
-    seg.appendChild(bPhoto);
-    seg.appendChild(bLive);
-
-    function setMode(m) {
-        mode = m;
-        bPhoto.className = (m === "photo") ? "on" : "";
-        bLive.className = (m === "live") ? "on" : "";
-        var hint = stage.querySelector(".live-hint");
-        if (hint) hint.style.display = (m === "photo") ? "block" : "none";
-        ctl.setMode(m);
-    }
-    bPhoto.onclick = function() { setMode("photo"); };
-    bLive.onclick = function() { setMode("live"); };
-
-    var right = document.createElement("div");
-    right.style.cssText = "display:flex;gap:6px;align-items:center;";
-    var expand = document.createElement("button");
-    expand.className = "action-btn";
-    expand.textContent = "Open";
-    expand.onclick = function() { openLightbox([stillMediaId], 0); };
-    right.appendChild(expand);
-    var dlWrap = document.createElement("span");
-    dlWrap.innerHTML = dlMenuHtml(unitId, unit);
-    right.appendChild(dlWrap);
-
-    toolbar.appendChild(seg);
-    toolbar.appendChild(right);
-    wrap.appendChild(toolbar);
-
-    var meta = document.createElement("div");
-    meta.className = "gallery-meta";
-    meta.textContent = baseName(unit.still.name) + " · " + formatBytes(unit.still.size + unit.mov.size);
-    wrap.appendChild(meta);
-
-    container.appendChild(wrap);
-}
-
 function ensureBatchCard(batchId, sender, total) {
     if (batchStore[batchId] && batchStore[batchId].cardEl) return batchStore[batchId];
     var list = document.getElementById("received-list");
@@ -3079,10 +3370,15 @@ function renderBatchBody(batchId) {
     if (!batch) return;
     var body = document.getElementById("batch-body-" + batchId);
     if (!body) return;
+
+    var old = body.querySelectorAll("img.lz");
+    for (var k = 0; k < old.length; k++) {
+        if (thumbObserver) thumbObserver.unobserve(old[k]);
+    }
     (batch.unitIds || []).forEach(function(id) { delete unitRegistry[id]; });
     batch.unitIds = [];
-    body.innerHTML = "";
     batch.mediaIds = [];
+    body.innerHTML = "";
 
     var units = buildUnits(batch.items);
     batch.units = units;
@@ -3097,30 +3393,21 @@ function renderBatchBody(batchId) {
     if (allVisual) {
         var grid = document.createElement("div");
         grid.className = "media-gallery";
-        var ids = [];
-        units.forEach(function(u) {
+        var ids = units.map(function(u) {
             var it = (u.kind === "live") ? u.still : u.item;
             var mediaId = registerMedia(it);
             if (u.kind === "live") u.stillMediaId = mediaId;
-            ids.push(mediaId);
+            return mediaId;
         });
         batch.mediaIds = ids;
         units.forEach(function(u, idx) {
             var it = (u.kind === "live") ? u.still : u.item;
             var thumb = document.createElement("div");
             thumb.className = "media-thumb";
-            (function(i) {
-                thumb.onclick = function() { openLightbox(ids, i, units); };
-            })(idx);
-            if (isStillImage(it)) {
-                if (it.previewFailed) {
-                    thumb.innerHTML = heicFallbackThumbHtml();
-                } else {
-                    thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="' + escapeHtml(it.name) + '" loading="lazy">';
-                }
-            } else {
-                thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>' +
-                    '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>';
+            thumb.onclick = function() { openLightbox(ids, idx, units); };
+            makeLazyImg(thumb, it, THUMB_SIZE);
+            if (!isStillImage(it)) {
+                thumb.insertAdjacentHTML("beforeend", '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>');
             }
             if (u.kind === "live") thumb.insertAdjacentHTML("beforeend", liveBadgeHtml());
             grid.appendChild(thumb);
@@ -3151,29 +3438,14 @@ function renderBatchBody(batchId) {
                 var pos = listUnits.indexOf(u);
                 var thumb = document.createElement("div");
                 thumb.className = "batch-file-thumb";
-                (function(p) {
-                    thumb.onclick = function() { openLightbox(listIds, p, listUnits); };
-                })(pos);
-                if (isStillImage(it)) {
-                    if (it.previewFailed) {
-                        thumb.innerHTML = heicFallbackThumbHtml();
-                    } else {
-                        thumb.innerHTML = '<img src="' + previewSrc(it) + '" alt="">';
-                    }
-                } else {
-                    thumb.innerHTML = '<video src="' + it.url + '" muted preload="metadata"></video>';
-                }
+                thumb.onclick = function() { openLightbox(listIds, pos, listUnits); };
+                makeLazyImg(thumb, it, THUMB_SIZE);
                 row.appendChild(thumb);
-            } else if (isAudioType(it.type)) {
+            } else {
                 var icon = document.createElement("div");
                 icon.className = "batch-file-icon";
-                icon.textContent = "AUD";
+                icon.textContent = isAudioType(it.type) ? "AUD" : fileExtLabel(it.name, it.type);
                 row.appendChild(icon);
-            } else {
-                var icon2 = document.createElement("div");
-                icon2.className = "batch-file-icon";
-                icon2.textContent = fileExtLabel(it.name, it.type);
-                row.appendChild(icon2);
             }
 
             var meta = document.createElement("div");
@@ -3183,10 +3455,8 @@ function renderBatchBody(batchId) {
             if (u.kind === "live") {
                 nameLine += ' <span style="color:var(--live);font-weight:700;font-size:10px;">LIVE</span>';
                 sizeLine = formatBytes(u.still.size + u.mov.size) + " (photo + video)";
-            } else if (it.convertedFromHeic) {
+            } else if (isHeicType(it.type, it.name)) {
                 nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC)</span>';
-            } else if (it.previewFailed) {
-                nameLine += ' <span style="color:var(--muted2);font-weight:400;">(HEIC, no preview)</span>';
             }
             meta.innerHTML =
                 '<span class="batch-file-name" title="' + escapeHtml(it.name) + '">' + nameLine + '</span>' +
@@ -3196,7 +3466,7 @@ function renderBatchBody(batchId) {
             if (isAudioType(it.type)) {
                 var audioWrap = document.createElement("div");
                 audioWrap.className = "batch-audio-row";
-                audioWrap.innerHTML = '<audio controls preload="metadata" src="' + it.url + '"></audio>';
+                audioWrap.innerHTML = '<audio controls preload="none" src="' + it.url + '"></audio>';
                 row.appendChild(audioWrap);
             }
 
@@ -3226,31 +3496,30 @@ function scheduleBatchRender(batchId) {
 function addToBatch(batchId, item, sender) {
     var total = item.batch_total || 1;
     var batch = ensureBatchCard(batchId, sender, total);
+    normalizeItemMime(item);
+    batch.items.push(item);
 
-    prepareItemPreview(item).then(function(ready) {
-        batch.items.push(ready);
-        var metaEl = document.getElementById("batch-meta-" + batchId);
-        var done = batch.items.length;
+    var metaEl = document.getElementById("batch-meta-" + batchId);
+    var done = batch.items.length;
 
-        if (done >= total) {
-            var units = buildUnits(batch.items);
-            var liveCount = units.filter(function(u) { return u.kind === "live"; }).length;
-            var label = done + " file" + (done > 1 ? "s" : "") + " · " +
-                formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
-            if (liveCount) label += " · " + liveCount + " Live Photo" + (liveCount > 1 ? "s" : "");
-            metaEl.textContent = label;
-            if (batch.renderTimer) {
-                clearTimeout(batch.renderTimer);
-                batch.renderTimer = null;
-            }
-            renderBatchBody(batchId);
-            notifyIncoming(sender, done + " file" + (done > 1 ? "s" : ""));
-            document.getElementById("batch-actions-" + batchId).style.display = "flex";
-        } else {
-            metaEl.textContent = "Receiving " + done + " / " + total + "...";
-            scheduleBatchRender(batchId);
+    if (done >= total) {
+        var units = buildUnits(batch.items);
+        var liveCount = units.filter(function(u) { return u.kind === "live"; }).length;
+        var label = done + " file" + (done > 1 ? "s" : "") + " · " +
+            formatBytes(batch.items.reduce(function(s, x) { return s + (x.size || 0); }, 0));
+        if (liveCount) label += " · " + liveCount + " Live Photo" + (liveCount > 1 ? "s" : "");
+        metaEl.textContent = label;
+        if (batch.renderTimer) {
+            clearTimeout(batch.renderTimer);
+            batch.renderTimer = null;
         }
-    });
+        renderBatchBody(batchId);
+        notifyIncoming(sender, done + " file" + (done > 1 ? "s" : ""));
+        document.getElementById("batch-actions-" + batchId).style.display = "flex";
+    } else {
+        metaEl.textContent = "Receiving " + done + " / " + total + "...";
+        scheduleBatchRender(batchId);
+    }
 }
 
 function addReceived(type, data, sender) {
@@ -3298,53 +3567,53 @@ function addReceived(type, data, sender) {
         return;
     }
 
-    prepareItemPreview(data).then(function(item) {
-        var li = document.createElement("li");
-        li.className = "feed-item";
+    var item = normalizeItemMime(data);
+    var li2 = document.createElement("li");
+    li2.className = "feed-item";
 
-        var header =
-            '<div class="feed-header">' +
-                '<div class="feed-author">' +
-                    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
-                    '<span>' + escapeHtml(sender) + '</span>' +
-                '</div>' +
-                '<span class="feed-time">' + time + '</span>' +
-            '</div>';
+    var header =
+        '<div class="feed-header">' +
+            '<div class="feed-author">' +
+                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>' +
+                '<span>' + escapeHtml(sender) + '</span>' +
+            '</div>' +
+            '<span class="feed-time">' + time + '</span>' +
+        '</div>';
 
-        var unit = { kind: "single", item: item };
-        var unitId = registerUnit(unit);
-        var mediaId = registerMedia(item);
-        var titleExtra = "";
-        if (item.convertedFromHeic) titleExtra = ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC)</span>';
-        else if (item.previewFailed) titleExtra = ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC, no preview)</span>';
+    var unit = { kind: "single", item: item };
+    var unitId = registerUnit(unit);
+    var mediaId = registerMedia(item);
+    var titleExtra = isHeicType(item.type, item.name) ? ' <span style="color:var(--muted2);font-weight:400;font-size:11px;">(HEIC)</span>' : "";
 
-        var previewHtml = "";
-        if (isStillImage(item)) {
-            if (item.previewFailed) {
-                previewHtml = '<div class="file-preview heic-fallback-wrap">' + heicFallbackCardHtml() + '</div>';
-            } else {
-                previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><img src="' + previewSrc(item) + '" class="preview-img" alt="preview" /></div>';
-            }
-        } else if (isVideoType(item.type)) {
-            previewHtml = '<div class="file-preview" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"><video src="' + item.url + '" class="preview-img" muted playsinline></video></div>';
-        } else if (isAudioType(item.type)) {
-            previewHtml = '<div class="audio-player-wrap"><audio controls preload="metadata" src="' + item.url + '"></audio></div>';
+    var previewHtml = "";
+    var lazyPreview = isStillImage(item) || isVideoType(item.type);
+    if (lazyPreview) {
+        previewHtml = '<div class="file-preview" data-lazy="1" style="cursor:pointer" onclick="openLightbox([\'' + mediaId + '\'], 0)"></div>';
+    } else if (isAudioType(item.type)) {
+        previewHtml = '<div class="audio-player-wrap"><audio controls preload="none" src="' + item.url + '"></audio></div>';
+    }
+    if (isHeicType(item.type, item.name)) previewHtml += liveTipHtml();
+
+    li2.innerHTML = header +
+        '<div class="file-card">' +
+            '<div class="file-meta">' +
+                '<span class="file-title" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + titleExtra + '</span>' +
+                '<span class="file-size">' + formatBytes(item.size) + '</span>' +
+            '</div>' +
+            '<span class="dl-slot">' + dlMenuHtml(unitId, unit) + '</span>' +
+        '</div>' + previewHtml;
+    list.insertBefore(li2, list.firstChild);
+
+    var host = li2.querySelector('.file-preview[data-lazy]');
+    if (host) {
+        var im = makeLazyImg(host, item, CARD_SIZE);
+        im.classList.add("preview-img");
+        if (isVideoType(item.type)) {
+            host.insertAdjacentHTML("beforeend", '<div class="play-badge"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>');
         }
-
-        if (isHeicType(item.type, item.name)) previewHtml += liveTipHtml();
-
-        li.innerHTML = header +
-            '<div class="file-card">' +
-                '<div class="file-meta">' +
-                    '<span class="file-title" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + titleExtra + '</span>' +
-                    '<span class="file-size">' + formatBytes(item.size) + '</span>' +
-                '</div>' +
-                '<span class="dl-slot">' + dlMenuHtml(unitId, unit) + '</span>' +
-            '</div>' + previewHtml;
-        list.insertBefore(li, list.firstChild);
-        decorateFeedItem(li, function() { return [item]; });
-        notifyIncoming(sender, item.name);
-    });
+    }
+    decorateFeedItem(li2, function() { return [item]; });
+    notifyIncoming(sender, item.name);
 }
 
 var lightboxUnits = null;
@@ -3389,6 +3658,55 @@ function currentLightboxUnit() {
     return item ? { kind: "single", item: item } : null;
 }
 
+function showLbFallback(stage, item, text) {
+    var label = isHeicType(item.type, item.name) ? "HEIC" : fileExtLabel(item.name, item.type);
+    stage.innerHTML = '<div class="lb-heic-fallback"><span class="heic-chip">' + escapeHtml(label) + '</span><span class="heic-sub">' + text + '</span></div>';
+}
+
+function loadLightboxImage(stage, img, item) {
+    var idx = lightboxIndex;
+    function stale() { return lightboxIndex !== idx || !img.isConnected; }
+    var low = item.thumbs && (item.thumbs[CARD_SIZE] || item.thumbs[THUMB_SIZE]);
+    var spinner = null;
+    if (low) {
+        img.src = low;
+    } else {
+        spinner = document.createElement("div");
+        spinner.className = "lb-loading";
+        spinner.textContent = "Loading…";
+        stage.appendChild(spinner);
+    }
+    function fail() {
+        if (stale()) return;
+        if (low) { showToast("Could not load the full-size preview"); return; }
+        showLbFallback(stage, item, "Preview not supported in this browser. Use Download to save the original.");
+    }
+    var source = isHeicType(item.type, item.name) ? ensureViewUrl(item) : Promise.resolve(item.url);
+    source.then(function(url) {
+        if (stale() || !url) return;
+        var pre = new Image();
+        pre.onload = function() {
+            if (stale()) return;
+            img.src = url;
+            if (spinner && spinner.parentNode) spinner.parentNode.removeChild(spinner);
+        };
+        pre.onerror = fail;
+        pre.src = url;
+    }).catch(fail);
+}
+
+function prefetchLightboxNeighbors() {
+    var idx = lightboxIndex;
+    setTimeout(function() {
+        if (lightboxIndex !== idx || lightboxItems.length < 2) return;
+        [1, -1].forEach(function(d) {
+            var id = lightboxItems[(idx + d + lightboxItems.length) % lightboxItems.length];
+            var it = mediaRegistry[id];
+            if (it && isHeicType(it.type, it.name)) ensureViewUrl(it).catch(function() {});
+        });
+    }, 350);
+}
+
 function renderLightbox() {
     stopLightboxLive();
     var unit = currentLightboxUnit();
@@ -3402,25 +3720,16 @@ function renderLightbox() {
 
     if (unit.kind === "live") {
         var mode = lightboxMode[lightboxIndex] || "photo";
-
-        if (unit.still.previewFailed) {
-            stage.innerHTML = '<div class="lb-heic-fallback">' +
-                '<span class="heic-chip">HEIC</span>' +
-                '<span class="heic-sub">Photo preview not supported in this browser. Use Download to save the original HEIC + MOV pair.</span>' +
-            '</div>';
-        } else {
-            var img = document.createElement("img");
-            img.src = previewSrc(unit.still);
-            img.alt = unit.still.name || "";
-            stage.appendChild(img);
-            stage.insertAdjacentHTML("beforeend", liveBadgeHtml());
-            var hint = document.createElement("div");
-            hint.className = "lb-live-hint";
-            hint.textContent = "Press and hold the photo to play Live";
-            stage.appendChild(hint);
-
-            lbLiveCtl = attachLiveStage(stage, unit, function() { return lightboxMode[lightboxIndex] || "photo"; });
-        }
+        var img = document.createElement("img");
+        img.alt = unit.still.name || "";
+        stage.appendChild(img);
+        stage.insertAdjacentHTML("beforeend", liveBadgeHtml());
+        var hint = document.createElement("div");
+        hint.className = "lb-live-hint";
+        hint.textContent = "Press and hold the photo to play Live";
+        stage.appendChild(hint);
+        lbLiveCtl = attachLiveStage(stage, unit, function() { return lightboxMode[lightboxIndex] || "photo"; });
+        loadLightboxImage(stage, img, unit.still);
 
         var seg = document.createElement("div");
         seg.className = "seg";
@@ -3430,14 +3739,14 @@ function renderLightbox() {
         bLive.textContent = "Live";
         seg.appendChild(bPhoto);
         seg.appendChild(bLive);
-        function apply(m) {
+        var apply = function(m) {
             lightboxMode[lightboxIndex] = m;
             bPhoto.className = (m === "photo") ? "on" : "";
             bLive.className = (m === "live") ? "on" : "";
             var hintEl = stage.querySelector(".lb-live-hint");
             if (hintEl) hintEl.style.display = (m === "photo") ? "block" : "none";
             if (lbLiveCtl) lbLiveCtl.setMode(m);
-        }
+        };
         bPhoto.onclick = function() { apply("photo"); };
         bLive.onclick = function() { apply("live"); };
         bottom.appendChild(seg);
@@ -3447,6 +3756,7 @@ function renderLightbox() {
         nm.className = "lightbox-name";
         nm.textContent = unit.still.name + " + " + unit.mov.name;
         bottom.appendChild(nm);
+        prefetchLightboxNeighbors();
         return;
     }
 
@@ -3464,19 +3774,14 @@ function renderLightbox() {
         a.autoplay = true;
         a.style.width = "min(90vw, 420px)";
         stage.appendChild(a);
-    } else if (item.previewFailed) {
-        stage.innerHTML = '<div class="lb-heic-fallback">' +
-            '<span class="heic-chip">HEIC</span>' +
-            '<span class="heic-sub">Preview not supported in this browser. The original file is intact, use Download to save it.</span>' +
-        '</div>';
     } else {
         var img2 = document.createElement("img");
-        img2.src = previewSrc(item);
         img2.alt = item.name || "";
         stage.appendChild(img2);
+        loadLightboxImage(stage, img2, item);
     }
 
-    if (isHeicType(item.type, item.name) && !item.previewFailed) {
+    if (isHeicType(item.type, item.name)) {
         var seg2 = document.createElement("div");
         seg2.className = "seg";
         var showJpg = document.createElement("button");
@@ -3495,6 +3800,7 @@ function renderLightbox() {
     nm2.className = "lightbox-name";
     nm2.textContent = item.name;
     bottom.appendChild(nm2);
+    prefetchLightboxNeighbors();
 }
 
 function downloadLightboxItem() {
@@ -3507,20 +3813,28 @@ function downloadLightboxItem() {
     }
 }
 
-function batchFilesForZip(batch, keepHeic) {
-    var tasks = [];
-    batch.items.forEach(function(item) {
+function batchFilesForZip(batch, keepHeic, onProgress) {
+    var done = 0;
+    var total = batch.items.length;
+    return Promise.all(batch.items.map(function(item) {
+        var p;
         if (isHeicType(item.type, item.name) && !keepHeic) {
-            tasks.push(ensureJpegPreview(item).then(function(jpg) {
-                return { name: swapExt(item.name, "jpg"), blob: jpg };
+            p = getItemBlob(item).then(function(b) {
+                return heicRender(b, 0, 0.92);
+            }).then(function(jb) {
+                return { name: swapExt(item.name, "jpg"), blob: jb };
             }).catch(function() {
                 return { name: item.name, blob: item.blob || null, url: item.url };
-            }));
+            });
         } else {
-            tasks.push(Promise.resolve({ name: item.name, blob: item.blob || null, url: item.url }));
+            p = Promise.resolve({ name: item.name, blob: item.blob || null, url: item.url });
         }
-    });
-    return Promise.all(tasks);
+        return p.then(function(r) {
+            done++;
+            if (onProgress) onProgress(done, total);
+            return r;
+        });
+    }));
 }
 
 function downloadBatchIndividual(batchId) {
@@ -3558,14 +3872,17 @@ function downloadBatchZip(batchId) {
     var zip = new JSZip();
     var folder = zip.folder("pairme_" + batchId.slice(-6));
 
-    batchFilesForZip(batch, keep).then(function(files) {
+    batchFilesForZip(batch, keep, function(d, t) {
+        if (btn) btn.textContent = "Converting " + d + "/" + t;
+    }).then(function(files) {
         var adds = files.map(function(f) {
             if (f.blob) { folder.file(f.name || "file", f.blob); return Promise.resolve(); }
             return fetch(f.url).then(function(r) { return r.blob(); }).then(function(b) { folder.file(f.name || "file", b); });
         });
         return Promise.all(adds);
     }).then(function() {
-        return zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+        if (btn) btn.textContent = "Zipping...";
+        return zip.generateAsync({ type: "blob", compression: "STORE" });
     }).then(function(content) {
         var url = URL.createObjectURL(content);
         triggerDownload(url, "pairme_" + batchId.slice(-6) + ".zip");
