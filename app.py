@@ -18,7 +18,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pairme")
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 SECRET = os.environ.get("SECRET_KEY") or hashlib.sha256(os.urandom(32)).hexdigest()
 
 app = Flask(__name__)
@@ -2665,7 +2665,6 @@ function videoPosterBlob(item, size) {
     });
 }
 
-/* ---- HEIC: native (Safari) -> worker pool -> main thread fallback ---- */
 var nativeLimiter = makeLimiter(2);
 
 function nativeHeicRender(blob, max, quality) {
@@ -2868,7 +2867,6 @@ function mainThreadHeicRender(blob, max, quality) {
     return run;
 }
 
-/* max = 0 means full resolution */
 function heicRender(blob, max, quality) {
     return nativeHeicRender(blob, max, quality).catch(function() {
         return heicWorkerRender(blob, max, quality).catch(function(err) {
@@ -2881,7 +2879,6 @@ function heicRender(blob, max, quality) {
     });
 }
 
-/* ---- thumbnails: created only when the tile is visible ---- */
 function produceThumbBlob(item, size) {
     if (isVideoType(item.type)) return videoPosterBlob(item, size);
     return getItemBlob(item).then(function(blob) {
@@ -3047,7 +3044,6 @@ function disposeItem(item) {
     if (i >= 0) viewLru.splice(i, 1);
 }
 
-/* ---- full-size view (lightbox only), HEIC converted on demand ---- */
 function touchView(item) {
     var i = viewLru.indexOf(item);
     if (i >= 0) viewLru.splice(i, 1);
@@ -3156,35 +3152,108 @@ function triggerDownload(url, name) {
     document.body.removeChild(a);
 }
 
+function isIOS() {
+    var ua = navigator.userAgent || "";
+    var isIPadOS = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+    return /iPad|iPhone|iPod/.test(ua) || isIPadOS;
+}
+
+function canNativeShareFiles() {
+    return !!(navigator.share && navigator.canShare);
+}
+
+function fileFromBlob(blob, name, mime) {
+    return new File([blob], name || "file", { type: mime || blob.type || "application/octet-stream" });
+}
+
+function trySystemShareFiles(files) {
+    if (!canNativeShareFiles()) return Promise.resolve(false);
+    var ok = false;
+    try { ok = navigator.canShare({ files: files }); } catch (e) { ok = false; }
+    if (!ok) return Promise.resolve(false);
+    return navigator.share({ files: files }).then(function() {
+        return true;
+    }, function(err) {
+        return !!(err && err.name === "AbortError");
+    });
+}
+
+function saveBlobSmart(blob, name, mime) {
+    if (isIOS() && canNativeShareFiles()) {
+        var file = fileFromBlob(blob, name, mime);
+        return trySystemShareFiles([file]).then(function(handled) {
+            if (handled) return;
+            var u = URL.createObjectURL(blob);
+            triggerDownload(u, name);
+            setTimeout(function() { URL.revokeObjectURL(u); }, 10000);
+        });
+    }
+    var url = URL.createObjectURL(blob);
+    triggerDownload(url, name);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+    return Promise.resolve();
+}
+
+function saveUrlSmart(url, name, mime) {
+    if (isIOS() && canNativeShareFiles()) {
+        return fetch(url).then(function(r) { return r.blob(); }).then(function(blob) {
+            return saveBlobSmart(blob, name, mime || blob.type);
+        }).catch(function() {
+            triggerDownload(url, name);
+        });
+    }
+    triggerDownload(url, name);
+    return Promise.resolve();
+}
+
 function downloadOriginal(item) {
-    triggerDownload(item.url, item.name);
+    if (item.blob) {
+        saveBlobSmart(item.blob, item.name, item.type);
+        return;
+    }
+    saveUrlSmart(item.url, item.name, item.type);
 }
 
 function downloadAsJpg(item) {
     if (!isHeicType(item.type, item.name)) {
-        triggerDownload(item.url, item.name);
+        downloadOriginal(item);
         return;
     }
     showToast("Converting to JPG...");
     getItemBlob(item).then(function(b) {
         return heicRender(b, 0, 0.92);
     }).then(function(jb) {
-        var u = URL.createObjectURL(jb);
-        triggerDownload(u, swapExt(item.name, "jpg"));
-        setTimeout(function() { URL.revokeObjectURL(u); }, 10000);
+        return saveBlobSmart(jb, swapExt(item.name, "jpg"), "image/jpeg");
     }).catch(function() {
         showToast("Could not convert. Downloading original HEIC instead.");
-        triggerDownload(item.url, item.name);
+        downloadOriginal(item);
     });
 }
 
 function downloadLiveMov(unit) {
-    triggerDownload(unit.mov.url, unit.mov.name);
+    if (unit.mov.blob) {
+        saveBlobSmart(unit.mov.blob, unit.mov.name, unit.mov.type);
+        return;
+    }
+    saveUrlSmart(unit.mov.url, unit.mov.name, unit.mov.type);
 }
 
 function downloadLivePair(unit) {
-    triggerDownload(unit.still.url, unit.still.name);
-    setTimeout(function() { triggerDownload(unit.mov.url, unit.mov.name); }, 400);
+    var still = unit.still, mov = unit.mov;
+    if (isIOS() && canNativeShareFiles() && still.blob && mov.blob) {
+        var files = [
+            fileFromBlob(still.blob, still.name, still.type),
+            fileFromBlob(mov.blob, mov.name, mov.type)
+        ];
+        trySystemShareFiles(files).then(function(handled) {
+            if (handled) return;
+            downloadOriginal(still);
+            setTimeout(function() { downloadLiveMov(unit); }, 400);
+        });
+        return;
+    }
+    downloadOriginal(still);
+    setTimeout(function() { downloadLiveMov(unit); }, 400);
 }
 
 function closeAllDlPops() {
@@ -3756,6 +3825,13 @@ function renderLightbox() {
         nm.className = "lightbox-name";
         nm.textContent = unit.still.name + " + " + unit.mov.name;
         bottom.appendChild(nm);
+        if (isIOS()) {
+            var tip = document.createElement("span");
+            tip.className = "lightbox-name";
+            tip.style.opacity = "0.7";
+            tip.textContent = "Tip: press & hold the photo to save to Photos";
+            bottom.appendChild(tip);
+        }
         prefetchLightboxNeighbors();
         return;
     }
@@ -3800,6 +3876,13 @@ function renderLightbox() {
     nm2.className = "lightbox-name";
     nm2.textContent = item.name;
     bottom.appendChild(nm2);
+    if (isIOS() && isStillImage(item)) {
+        var tip2 = document.createElement("span");
+        tip2.className = "lightbox-name";
+        tip2.style.opacity = "0.7";
+        tip2.textContent = "Tip: press & hold the photo to save to Photos";
+        bottom.appendChild(tip2);
+    }
     prefetchLightboxNeighbors();
 }
 
@@ -3842,7 +3925,8 @@ function downloadBatchIndividual(batchId) {
     if (!batch) return;
     var keepEl = document.getElementById("batch-keepheic-" + batchId);
     var keep = keepEl ? keepEl.checked : true;
-    batchFilesForZip(batch, keep).then(function(files) {
+
+    function fallbackSequential(files) {
         files.forEach(function(f, i) {
             setTimeout(function() {
                 if (f.blob) {
@@ -3855,6 +3939,23 @@ function downloadBatchIndividual(batchId) {
             }, i * 350);
         });
         log("Downloading " + files.length + " files individually", "info");
+    }
+
+    batchFilesForZip(batch, keep).then(function(files) {
+        if (isIOS() && canNativeShareFiles()) {
+            var fileObjs = [];
+            for (var i = 0; i < files.length; i++) {
+                if (!files[i].blob) { fileObjs = null; break; }
+                fileObjs.push(fileFromBlob(files[i].blob, files[i].name, files[i].blob.type));
+            }
+            if (fileObjs) {
+                trySystemShareFiles(fileObjs).then(function(handled) {
+                    if (!handled) fallbackSequential(files);
+                });
+                return;
+            }
+        }
+        fallbackSequential(files);
     });
 }
 
